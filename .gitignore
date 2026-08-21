@@ -1,0 +1,23 @@
+# Measurement output. Result files include a speedtest.net result URL, which
+# links to a public page showing your ISP and approximate location - worth a
+# look before you share one.
+runs/
+
+# Local working files
+Troubleshooting/
+SPEC.md
+PLAN.md
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
