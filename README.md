@@ -172,6 +172,7 @@ change you want - so you weigh the trade rather than being handed a verdict.
 --snmp-community STR    overrides $NETDIAG_SNMP_COMMUNITY
 --snmp-interface NAME   router interface to measure (default: busiest)
 --snmp-port N           default 161
+--snmp-device SPEC      extra SNMP target, repeatable (see below)
 --raw                   include the full latency sample series in the JSON
 ```
 
@@ -266,8 +267,8 @@ other devices               1.110      0.179
 2. Change the **Get community** from `public` to something unguessable.
 3. Change the **Set community** from `private` too. It grants *write* access to
    your router's configuration and netdiag never uses it.
-4. Make sure SNMP is **not** exposed to the internet - on DrayTek that is a
-   separate switch under System Maintenance >> Management.
+4. Make sure SNMP is **not** exposed to the internet. On most routers this is
+   a separate switch on the management or remote-access page.
 
 ```bash
 export NETDIAG_SNMP_COMMUNITY="your-read-community"     # or setx on Windows
@@ -275,6 +276,54 @@ export NETDIAG_SNMP_COMMUNITY="your-read-community"     # or setx on Windows
 
 The community is read from the environment, never written to a result file and
 never logged. `--snmp-community` overrides it if you must.
+
+### Polling more than one device
+
+A mesh or multi-AP network has no single vantage point - the gateway sees the
+internet link, but nothing about which access point is carrying which client.
+`--snmp-device` is repeatable and takes
+`HOST[,env=VAR][,label=NAME][,iface=NAME][,port=N]`:
+
+```
+$ netdiag.py probe --duration 300 \
+    --snmp-device 192.0.2.1,label=gateway \
+    --snmp-device 192.0.2.2,env=AP_UPSTAIRS_COMMUNITY,label=upstairs \
+    --snmp-device 192.0.2.3,env=AP_GARAGE_COMMUNITY,label=garage,iface=LAN
+```
+
+`env` names **an environment variable, never the community itself**. A
+community passed with `--snmp-community` lands in your shell history and is
+visible to any process that can list command-line arguments. A variable name
+is not a secret, so it is safe to write in a script, a Makefile, or a README.
+
+Each device resolves its community in this order:
+
+```
+--snmp-community  ->  device's env=VAR  ->  $NETDIAG_SNMP_COMMUNITY  ->  "public"
+```
+
+Give each device its own community where the hardware allows it. Sharing one
+across every device means a single leak exposes all of them.
+
+Results gain a `devices` array alongside the existing `router_throughput`:
+
+```json
+"devices": [
+  {"label": "gateway",  "host": "192.0.2.1", "interface": "WAN2",
+   "down_mbps": 812.4, "up_mbps": 44.1, "sample_count": 297, "source": "snmp"},
+  {"label": "upstairs", "host": "192.0.2.2", "interface": "LAN",
+   "down_mbps": 210.7, "up_mbps": 18.3, "sample_count": 297, "source": "snmp"}
+]
+```
+
+`router_throughput` still describes the first device listed, so results saved
+by older versions and the `compare` command are unaffected.
+
+Each device is polled once per second, so three devices means three SNMP
+queries per second. A device that does not answer produces a warning on stderr
+and is skipped - the run continues on whatever did respond, rather than failing.
+The same counter-granularity caveat below applies per device, and cheap access
+points often refresh their counters far more slowly than a router does.
 
 **Counter granularity - read this before trusting a short window.** Routers
 refresh SNMP counters on their own schedule, and the rate varies widely by

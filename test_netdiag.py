@@ -1,4 +1,5 @@
 """Tests for netdiag. Standard library only; no network, no root, no OS assumptions."""
+import argparse
 import contextlib
 import io
 import json
@@ -1717,6 +1718,245 @@ class TestEndToEnd(unittest.TestCase):
                 self.assertGreater(total, 0, "no samples in %s phase" % phase)
         finally:
             os.unlink(handle.name)
+
+
+# --------------------------------------------------------------------------
+# MULTI-DEVICE SNMP
+# --------------------------------------------------------------------------
+
+
+class FakeSampler:
+    """Stands in for RouterSampler. Carries a community so the leak guard
+    below is testing something real rather than a vacuous assertion."""
+
+    def __init__(self, samples, community="unit-test-community-value"):
+        self._samples = samples
+        self.community = community
+        self.stopped = False
+        self.failures = 0
+
+    def samples(self):
+        return list(self._samples)
+
+    def stop(self):
+        self.stopped = True
+
+
+def _counter_samples(mbps_down=100.0, mbps_up=50.0, seconds=10, name="WAN"):
+    """Synthetic (stamp, {iface: (in_octets, out_octets)}) series."""
+    out = []
+    for i in range(seconds + 1):
+        down = int(mbps_down * 1e6 / 8 * i)
+        up = int(mbps_up * 1e6 / 8 * i)
+        out.append((float(i), {name: (down, up)}))
+    return out
+
+
+class TestSnmpDeviceSpec(unittest.TestCase):
+    def test_bare_host(self):
+        d = netdiag.parse_snmp_device_spec("192.0.2.1")
+        self.assertEqual(d.host, "192.0.2.1")
+        self.assertIsNone(d.community_env)
+        self.assertIsNone(d.interface)
+        self.assertIsNone(d.port)
+
+    def test_label_defaults_to_host(self):
+        self.assertEqual(netdiag.parse_snmp_device_spec("192.0.2.1").label,
+                         "192.0.2.1")
+
+    def test_env_key_stores_the_name_only(self):
+        d = netdiag.parse_snmp_device_spec("192.0.2.2,env=SOME_VAR_NAME")
+        self.assertEqual(d.community_env, "SOME_VAR_NAME")
+
+    def test_label_key_overrides_default(self):
+        d = netdiag.parse_snmp_device_spec("192.0.2.2,label=upstairs")
+        self.assertEqual(d.label, "upstairs")
+
+    def test_iface_and_port(self):
+        d = netdiag.parse_snmp_device_spec("192.0.2.3,iface=LAN,port=1610")
+        self.assertEqual(d.interface, "LAN")
+        self.assertEqual(d.port, 1610)
+
+    def test_all_keys_together(self):
+        d = netdiag.parse_snmp_device_spec(
+            "192.0.2.4,env=V,label=edge,iface=WAN2,port=161")
+        self.assertEqual((d.host, d.community_env, d.label, d.interface, d.port),
+                         ("192.0.2.4", "V", "edge", "WAN2", 161))
+
+    def test_whitespace_is_tolerated(self):
+        d = netdiag.parse_snmp_device_spec("  192.0.2.5 , env = V , label = x ")
+        self.assertEqual((d.host, d.community_env, d.label), ("192.0.2.5", "V", "x"))
+
+    def test_hostname_as_well_as_address(self):
+        d = netdiag.parse_snmp_device_spec("gateway.example.invalid")
+        self.assertEqual(d.host, "gateway.example.invalid")
+
+    def test_invalid_specs_raise(self):
+        for bad in ("", "   ", ",env=V", "192.0.2.1,nosuchkey=1",
+                    "192.0.2.1,env", "192.0.2.1,port=notanumber",
+                    "192.0.2.1,port=99999", "192.0.2.1,port=0",
+                    "192.0.2.1,env="):
+            with self.assertRaises(ValueError, msg="expected reject: %r" % bad):
+                netdiag.parse_snmp_device_spec(bad)
+
+    def test_device_stores_only_the_variable_name_never_the_value(self):
+        os.environ["NETDIAG_TEST_COMMUNITY"] = "s3cret-value"
+        try:
+            d = netdiag.parse_snmp_device_spec(
+                "192.0.2.9,env=NETDIAG_TEST_COMMUNITY")
+            # __slots__ means there is no __dict__ to inspect, which is
+            # itself part of the guarantee: the object cannot accumulate a
+            # stray attribute holding a secret.
+            blob = repr(d) + json.dumps(
+                {f: str(getattr(d, f)) for f in d.__slots__})
+            self.assertNotIn("s3cret-value", blob)
+            self.assertEqual(d.community_env, "NETDIAG_TEST_COMMUNITY")
+        finally:
+            os.environ.pop("NETDIAG_TEST_COMMUNITY", None)
+
+
+class TestDeviceCommunityResolution(unittest.TestCase):
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in
+                       ("NETDIAG_SNMP_COMMUNITY", "NETDIAG_TEST_DEV")}
+        for k in self._saved:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _args(self, **kw):
+        return argparse.Namespace(**kw)
+
+    def test_flag_beats_everything(self):
+        os.environ["NETDIAG_TEST_DEV"] = "from-device-env"
+        os.environ["NETDIAG_SNMP_COMMUNITY"] = "from-global-env"
+        d = netdiag.parse_snmp_device_spec("192.0.2.1,env=NETDIAG_TEST_DEV")
+        self.assertEqual(
+            netdiag.resolve_device_community(d, self._args(snmp_community="flag")),
+            "flag")
+
+    def test_device_env_beats_global_env(self):
+        os.environ["NETDIAG_TEST_DEV"] = "from-device-env"
+        os.environ["NETDIAG_SNMP_COMMUNITY"] = "from-global-env"
+        d = netdiag.parse_snmp_device_spec("192.0.2.1,env=NETDIAG_TEST_DEV")
+        self.assertEqual(
+            netdiag.resolve_device_community(d, self._args(snmp_community=None)),
+            "from-device-env")
+
+    def test_falls_back_to_global_env(self):
+        os.environ["NETDIAG_SNMP_COMMUNITY"] = "from-global-env"
+        d = netdiag.parse_snmp_device_spec("192.0.2.1")
+        self.assertEqual(
+            netdiag.resolve_device_community(d, self._args(snmp_community=None)),
+            "from-global-env")
+
+    def test_named_env_var_absent_falls_through_to_global(self):
+        os.environ["NETDIAG_SNMP_COMMUNITY"] = "from-global-env"
+        d = netdiag.parse_snmp_device_spec("192.0.2.1,env=NETDIAG_TEST_DEV")
+        self.assertEqual(
+            netdiag.resolve_device_community(d, self._args(snmp_community=None)),
+            "from-global-env")
+
+    def test_defaults_to_public(self):
+        d = netdiag.parse_snmp_device_spec("192.0.2.1")
+        self.assertEqual(
+            netdiag.resolve_device_community(d, self._args(snmp_community=None)),
+            "public")
+
+
+class TestBuildSnmpDevices(unittest.TestCase):
+    def test_router_snmp_alone_still_works(self):
+        args = argparse.Namespace(router_snmp="192.0.2.1", snmp_device=None)
+        devices = netdiag.build_snmp_devices(args)
+        self.assertEqual([d.host for d in devices], ["192.0.2.1"])
+
+    def test_snmp_device_flags(self):
+        args = argparse.Namespace(
+            router_snmp=None,
+            snmp_device=["192.0.2.1", "192.0.2.2,label=ap,env=V"])
+        devices = netdiag.build_snmp_devices(args)
+        self.assertEqual([d.label for d in devices], ["192.0.2.1", "ap"])
+
+    def test_router_snmp_is_not_duplicated(self):
+        args = argparse.Namespace(router_snmp="192.0.2.1",
+                                  snmp_device=["192.0.2.1,label=edge"])
+        devices = netdiag.build_snmp_devices(args)
+        self.assertEqual(len(devices), 1)
+        self.assertEqual(devices[0].label, "edge")
+
+    def test_router_snmp_leads_when_both_given(self):
+        args = argparse.Namespace(router_snmp="192.0.2.1",
+                                  snmp_device=["192.0.2.2,label=ap"])
+        devices = netdiag.build_snmp_devices(args)
+        self.assertEqual([d.host for d in devices], ["192.0.2.1", "192.0.2.2"])
+
+    def test_no_targets_gives_empty_list(self):
+        args = argparse.Namespace(router_snmp=None, snmp_device=None)
+        self.assertEqual(netdiag.build_snmp_devices(args), [])
+
+
+class TestSnmpDeviceGroup(unittest.TestCase):
+    def _group(self):
+        a = netdiag.parse_snmp_device_spec("192.0.2.1,label=edge")
+        b = netdiag.parse_snmp_device_spec("192.0.2.2,label=ap")
+        return netdiag.SnmpDeviceGroup([
+            (a, FakeSampler(_counter_samples(100.0, 50.0, name="WAN"))),
+            (b, FakeSampler(_counter_samples(20.0, 10.0, name="LAN"))),
+        ])
+
+    def test_samples_proxy_to_the_primary_device(self):
+        # router_throughput() takes anything with .samples(), so a group must
+        # behave like the single sampler it replaces.
+        group = self._group()
+        self.assertEqual(group.samples(), group.entries[0][1].samples())
+
+    def test_router_throughput_still_works_on_a_group(self):
+        report = netdiag.router_throughput(self._group())
+        self.assertIsNotNone(report)
+        self.assertEqual(report["source"], "snmp")
+        self.assertAlmostEqual(report["down_mbps"], 100.0, delta=1.0)
+
+    def test_device_reports_one_entry_per_device(self):
+        reports = self._group().device_reports()
+        self.assertEqual([r["label"] for r in reports], ["edge", "ap"])
+        self.assertEqual([r["host"] for r in reports],
+                         ["192.0.2.1", "192.0.2.2"])
+
+    def test_device_reports_carry_throughput(self):
+        reports = self._group().device_reports()
+        self.assertAlmostEqual(reports[0]["down_mbps"], 100.0, delta=1.0)
+        self.assertAlmostEqual(reports[1]["down_mbps"], 20.0, delta=1.0)
+
+    def test_stop_stops_every_sampler(self):
+        group = self._group()
+        group.stop()
+        self.assertTrue(all(s.stopped for _, s in group.entries))
+
+    def test_empty_group_is_falsy_and_safe(self):
+        group = netdiag.SnmpDeviceGroup([])
+        self.assertFalse(group)
+        self.assertEqual(group.device_reports(), [])
+        self.assertIsNone(netdiag.router_throughput(group))
+
+
+class TestNoCommunityLeak(unittest.TestCase):
+    def test_community_never_reaches_a_serialised_report(self):
+        secret = "unit-test-community-value"
+        device = netdiag.parse_snmp_device_spec("192.0.2.1,env=SOME_VAR")
+        sampler = FakeSampler(_counter_samples(), community=secret)
+        group = netdiag.SnmpDeviceGroup([(device, sampler)])
+        blob = json.dumps({
+            "devices": group.device_reports(keep_samples=True),
+            "router_throughput": netdiag.router_throughput(group,
+                                                           keep_samples=True),
+        })
+        self.assertNotIn(secret, blob)
+        self.assertNotIn("community", blob)
 
 
 if __name__ == "__main__":

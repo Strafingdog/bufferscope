@@ -1570,6 +1570,154 @@ class RouterSampler:
             return list(self._samples)
 
 
+class SnmpDevice:
+    """One SNMP target.
+
+    Deliberately stores the *name* of the environment variable holding the
+    community, never the community itself, so a device object can be logged,
+    repr'd or serialised without leaking a secret.
+    """
+
+    __slots__ = ("host", "community_env", "label", "interface", "port")
+
+    def __init__(self, host: str, community_env: Optional[str] = None,
+                 label: Optional[str] = None, interface: Optional[str] = None,
+                 port: Optional[int] = None):
+        self.host = host
+        self.community_env = community_env
+        self.label = label or host
+        self.interface = interface
+        self.port = port
+
+    def __repr__(self) -> str:
+        return "SnmpDevice(host=%r, label=%r)" % (self.host, self.label)
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, SnmpDevice):
+            return NotImplemented
+        return all(getattr(self, f) == getattr(other, f) for f in self.__slots__)
+
+
+_DEVICE_KEYS = ("env", "label", "iface", "port")
+
+
+def parse_snmp_device_spec(spec: str) -> SnmpDevice:
+    """Parse 'HOST[,key=value...]' into an SnmpDevice.
+
+    Keys: env, label, iface, port. Examples:
+      192.0.2.1
+      192.0.2.2,env=MY_AP_COMMUNITY,label=ap
+      gateway.example.invalid,iface=WAN2,port=161
+
+    'env' names an environment variable. Passing a community on the command
+    line is possible via --snmp-community, but it lands in shell history and
+    the process list, so naming a variable is preferred.
+    """
+    text = (spec or "").strip()
+    if not text:
+        raise ValueError("empty snmp device spec")
+
+    parts = [p.strip() for p in text.split(",")]
+    host = parts[0]
+    if not host:
+        raise ValueError("snmp device spec has no host: %r" % spec)
+
+    fields: Dict[str, str] = {}
+    for chunk in parts[1:]:
+        if not chunk:
+            continue
+        key, sep, value = chunk.partition("=")
+        key = key.strip().lower()
+        value = value.strip()
+        if not sep or not value:
+            raise ValueError("expected key=value in %r" % spec)
+        if key not in _DEVICE_KEYS:
+            raise ValueError("unknown key %r in %r (allowed: %s)"
+                             % (key, spec, ", ".join(_DEVICE_KEYS)))
+        fields[key] = value
+
+    port = None
+    if "port" in fields:
+        try:
+            port = int(fields["port"])
+        except ValueError:
+            raise ValueError("bad port in %r" % spec)
+        if not 1 <= port <= 65535:
+            raise ValueError("port out of range in %r" % spec)
+
+    return SnmpDevice(host=host, community_env=fields.get("env"),
+                      label=fields.get("label"), interface=fields.get("iface"),
+                      port=port)
+
+
+def resolve_device_community(device: SnmpDevice,
+                             args: "argparse.Namespace") -> str:
+    """Flag beats the device's named variable beats the global one beats
+    the SNMP default. Never logged, never written to a result."""
+    flag = getattr(args, "snmp_community", None)
+    if flag:
+        return flag
+    if device.community_env:
+        value = os.environ.get(device.community_env)
+        if value:
+            return value
+    return os.environ.get("NETDIAG_SNMP_COMMUNITY") or "public"
+
+
+def build_snmp_devices(args: "argparse.Namespace") -> List[SnmpDevice]:
+    """Collect targets from --snmp-device, with --router-snmp still honoured.
+
+    --router-snmp leads the list so that result['router_throughput'] keeps
+    describing the device older versions would have described.
+    """
+    devices = [parse_snmp_device_spec(s)
+               for s in (getattr(args, "snmp_device", None) or [])]
+    host = getattr(args, "router_snmp", None)
+    if host and not any(d.host == host for d in devices):
+        devices.insert(0, SnmpDevice(host))
+    return devices
+
+
+class SnmpDeviceGroup:
+    """Owns one RouterSampler per device and fans start/stop/samples out.
+
+    Proxies samples() to the primary device so router_throughput() and every
+    other existing caller work on a group exactly as they did on a lone
+    sampler.
+    """
+
+    def __init__(self, entries: List[Any]):
+        self.entries = list(entries)
+
+    def __bool__(self) -> bool:
+        return bool(self.entries)
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def samples(self) -> List[NicSnapshot]:
+        return self.entries[0][1].samples() if self.entries else []
+
+    def stop(self) -> None:
+        for _, sampler in self.entries:
+            sampler.stop()
+
+    def device_reports(self, keep_samples: bool = False) -> List[Dict[str, Any]]:
+        """Per-device throughput. Communities are never included."""
+        reports = []
+        for device, sampler in self.entries:
+            report = router_throughput(sampler, keep_samples=keep_samples)
+            if report is None:
+                report = {"down_mbps": None, "up_mbps": None,
+                          "sample_count": len(sampler.samples()),
+                          "source": "snmp",
+                          "note": "too few samples to measure throughput"}
+            entry: Dict[str, Any] = {"label": device.label, "host": device.host}
+            entry.update(report)
+            reports.append(entry)
+        return reports
+
+
 # --------------------------------------------------------------------------
 # REPORTERS
 # --------------------------------------------------------------------------
@@ -1843,6 +1991,12 @@ def _add_common(parser: "argparse.ArgumentParser") -> None:
     parser.add_argument("--snmp-port", type=int, default=161)
     parser.add_argument("--snmp-interface", metavar="NAME",
                         help="router interface to measure (default: the busiest)")
+    parser.add_argument("--snmp-device", action="append", metavar="SPEC",
+                        help="extra SNMP target, repeatable: "
+                             "HOST[,env=VAR][,label=NAME][,iface=NAME]"
+                             "[,port=N]. env names the environment "
+                             "variable holding that device's community, "
+                             "never the community itself")
     parser.add_argument("--probe", action="append", metavar="SPEC",
                         help="probe spec, repeatable, replaces the default set: "
                              "kind:host[:port][@dscp=NAME][#label] where kind is "
@@ -1939,30 +2093,41 @@ def pick_interface(counters: Dict[int, Tuple[int, int]],
 
 
 def start_router_sampler(args: "argparse.Namespace", origin: float):
-    """Return a started RouterSampler, or None with a warning on stderr."""
-    host = getattr(args, "router_snmp", None)
-    if not host:
+    """Return a started SnmpDeviceGroup, or None if nothing can be polled.
+
+    The group proxies samples() and stop() to its primary device, so callers
+    written against a single RouterSampler keep working unchanged.
+    """
+    devices = build_snmp_devices(args)
+    if not devices:
         return None
-    community = snmp_community(args)
-    port = getattr(args, "snmp_port", 161)
-    names = snmp_interfaces(host, community, port=port)
-    if not names:
-        print("warning: no SNMP reply from %s - continuing without router data"
-              % host, file=sys.stderr)
+    entries = []
+    for device in devices:
+        community = resolve_device_community(device, args)
+        port = device.port or getattr(args, "snmp_port", 161)
+        names = snmp_interfaces(device.host, community, port=port)
+        if not names:
+            print("warning: no SNMP reply from %s - continuing without its data"
+                  % device.label, file=sys.stderr)
+            continue
+        counters = snmp_counters(device.host, community, sorted(names), port=port)
+        wanted = device.interface or getattr(args, "snmp_interface", None)
+        index = pick_interface(counters, names, wanted)
+        if index is None:
+            print("warning: no usable interface on %s - continuing without its "
+                  "data" % device.label, file=sys.stderr)
+            continue
+        sampler = RouterSampler(device.host, community, [index], names, origin,
+                                interval=1.0, port=port)
+        sampler.start()
+        entries.append((device, sampler))
+        if not getattr(args, "quiet", False):
+            print("  snmp: polling %s on %s (%s)"
+                  % (names.get(index, index), device.label, device.host),
+                  file=sys.stderr)
+    if not entries:
         return None
-    counters = snmp_counters(host, community, sorted(names), port=port)
-    index = pick_interface(counters, names, getattr(args, "snmp_interface", None))
-    if index is None:
-        print("warning: no usable router interface - continuing without router "
-              "data", file=sys.stderr)
-        return None
-    sampler = RouterSampler(host, community, [index], names, origin,
-                            interval=1.0, port=port)
-    sampler.start()
-    if not getattr(args, "quiet", False):
-        print("  router: polling %s (%s)" % (names.get(index, index), host),
-              file=sys.stderr)
-    return sampler
+    return SnmpDeviceGroup(entries)
 
 
 def router_throughput(sampler, keep_samples: bool = False
@@ -2245,6 +2410,9 @@ def _measure_once(args: "argparse.Namespace"):
         result["observed_throughput"] = observed_throughput(nic.samples())
         result["router_throughput"] = router_throughput(
             router, keep_samples=getattr(args, "raw", False))
+        if router:
+            result["devices"] = router.device_reports(
+                keep_samples=getattr(args, "raw", False))
         _emit(result, args, render_human(result))
         return EXIT_OK if result["validation"]["trustworthy"] else EXIT_UNTRUSTWORTHY
 
@@ -2316,6 +2484,9 @@ def _measure_once(args: "argparse.Namespace"):
                 result["phases"][name]["throughput_mbps_router"] = value
         result["router_throughput"] = router_throughput(
             router, keep_samples=getattr(args, "raw", False))
+        if router:
+            result["devices"] = router.device_reports(
+                keep_samples=getattr(args, "raw", False))
     return result
 
 
@@ -2419,6 +2590,9 @@ def cmd_monitor(args: "argparse.Namespace") -> int:
     result["observed_throughput"] = observed_throughput(nic.samples())
     result["router_throughput"] = router_throughput(
             router, keep_samples=getattr(args, "raw", False))
+    if router:
+        result["devices"] = router.device_reports(
+            keep_samples=getattr(args, "raw", False))
     _emit(result, args, render_human(result))
     return EXIT_OK if result["validation"]["trustworthy"] else EXIT_UNTRUSTWORTHY
 
