@@ -1282,6 +1282,31 @@ OID_IF_NAME = "1.3.6.1.2.1.31.1.1.1.1"
 # every 34 seconds at gigabit, which would silently produce nonsense.
 OID_IF_HC_IN = "1.3.6.1.2.1.31.1.1.1.6"
 OID_IF_HC_OUT = "1.3.6.1.2.1.31.1.1.1.10"
+# The 32-bit originals, for devices that implement nothing else. Many access
+# points do exactly that. They wrap, so every delta goes through unwrap_delta.
+OID_IF_IN = "1.3.6.1.2.1.2.2.1.10"
+OID_IF_OUT = "1.3.6.1.2.1.2.2.1.16"
+
+COUNTER32_MODULUS = 2 ** 32
+COUNTER64_MODULUS = 2 ** 64
+
+
+def unwrap_delta(previous: int, current: int, modulus: int,
+                 max_delta: Optional[int] = None) -> int:
+    """Bytes transferred between two readings of a wrapping counter.
+
+    A counter that reads lower than last time has either wrapped or been
+    reset by a reboot. Adding one modulus separates the two cases: a genuine
+    wrap yields a small plausible delta, a reset yields an enormous one. When
+    max_delta is given, a delta above it is treated as a reset and reported as
+    zero, since inventing 4 GB of traffic is worse than admitting to a gap.
+    """
+    if current >= previous:
+        return current - previous
+    delta = current - previous + modulus
+    if max_delta is not None and delta > max_delta:
+        return 0
+    return delta
 
 _UNSIGNED_TAGS = (0x41, 0x42, 0x43, 0x46)
 _EXCEPTION_TAGS = {0x80: "noSuchObject", 0x81: "noSuchInstance",
@@ -1500,22 +1525,83 @@ def snmp_interfaces(host: str, community: str, timeout: float = 2.0,
     return names
 
 
+def _counter_pair(host: str, community: str, in_oid: str, out_oid: str,
+                  index: int, timeout: float, port: int
+                  ) -> Optional[Tuple[int, int]]:
+    """One (in, out) reading, or None if the device does not implement it."""
+    parsed = snmp_query(host, community,
+                        ["%s.%d" % (in_oid, index), "%s.%d" % (out_oid, index)],
+                        timeout=timeout, port=port)
+    if not parsed or parsed.get("error_status"):
+        return None
+    values = [v for _, v in parsed["varbinds"]]
+    if len(values) == 2 and all(isinstance(v, int) for v in values):
+        return (values[0], values[1])
+    return None
+
+
+def snmp_counter_readings(host: str, community: str, indexes: List[int],
+                          timeout: float = 2.0, port: int = 161
+                          ) -> Dict[int, Tuple[int, int, int]]:
+    """Read (in, out, modulus) octet counters for the given interface indexes.
+
+    Prefers the 64-bit ifHC counters, which never wrap in practice. Devices
+    that do not implement them - most cheap access points - are read from the
+    32-bit originals instead, and the modulus is returned so the caller can
+    correct the wrap those counters will certainly hit.
+    """
+    out: Dict[int, Tuple[int, int, int]] = {}
+    for index in indexes:
+        pair = _counter_pair(host, community, OID_IF_HC_IN, OID_IF_HC_OUT,
+                             index, timeout, port)
+        if pair is not None:
+            out[index] = (pair[0], pair[1], COUNTER64_MODULUS)
+            continue
+        pair = _counter_pair(host, community, OID_IF_IN, OID_IF_OUT,
+                             index, timeout, port)
+        if pair is not None:
+            out[index] = (pair[0], pair[1], COUNTER32_MODULUS)
+    return out
+
+
 def snmp_counters(host: str, community: str, indexes: List[int],
                   timeout: float = 2.0, port: int = 161
                   ) -> Dict[int, Tuple[int, int]]:
-    """Read 64-bit (in, out) octet counters for the given interface indexes."""
-    out: Dict[int, Tuple[int, int]] = {}
-    for index in indexes:
-        parsed = snmp_query(
-            host, community,
-            ["%s.%d" % (OID_IF_HC_IN, index), "%s.%d" % (OID_IF_HC_OUT, index)],
-            timeout=timeout, port=port)
-        if not parsed or parsed.get("error_status"):
-            continue
-        values = [v for _, v in parsed["varbinds"]]
-        if len(values) == 2 and all(isinstance(v, int) for v in values):
-            out[index] = (values[0], values[1])
-    return out
+    """Read (in, out) octet counters. Kept for callers that want a raw
+    reading without the modulus."""
+    return {i: (rx, tx) for i, (rx, tx, _m)
+            in snmp_counter_readings(host, community, indexes,
+                                     timeout=timeout, port=port).items()}
+
+
+class CounterAccumulator:
+    """Turns raw, wrapping counter readings into monotonic byte totals.
+
+    Downstream code subtracts the first sample in a window from the last, so
+    it must never see a counter go backwards. Each interface starts from its
+    own zero at the first reading it appears in.
+    """
+
+    def __init__(self, max_delta: Optional[int] = None):
+        self.max_delta = max_delta
+        self._previous: Dict[int, Tuple[int, int]] = {}
+        self._totals: Dict[int, Tuple[int, int]] = {}
+
+    def update(self, readings: Dict[int, Tuple[int, int, int]]
+               ) -> Dict[int, Tuple[int, int]]:
+        out: Dict[int, Tuple[int, int]] = {}
+        for index, (rx, tx, modulus) in readings.items():
+            previous = self._previous.get(index)
+            if previous is None:
+                self._totals[index] = (0, 0)
+            else:
+                rx_delta = unwrap_delta(previous[0], rx, modulus, self.max_delta)
+                tx_delta = unwrap_delta(previous[1], tx, modulus, self.max_delta)
+                total = self._totals[index]
+                self._totals[index] = (total[0] + rx_delta, total[1] + tx_delta)
+            self._previous[index] = (rx, tx)
+            out[index] = self._totals[index]
+        return out
 
 
 class RouterSampler:
@@ -1540,19 +1626,29 @@ class RouterSampler:
         self._lock = threading.Lock()
         self._samples: List[NicSnapshot] = []
         self.failures = 0
+        # One second of gigabit is 125 MB; anything past a second of 10 Gbps
+        # between polls is a counter reset, not traffic.
+        self._accumulator = CounterAccumulator(max_delta=1_250_000_000)
+
+    def poll_once(self, stamp: Optional[float] = None) -> None:
+        """One poll, accumulated and recorded. Separated from the loop so the
+        wrap arithmetic can be tested without a thread or a real device."""
+        readings = snmp_counter_readings(self.host, self.community,
+                                         self.indexes, port=self.port)
+        if stamp is None:
+            stamp = time.perf_counter() - self.origin
+        if readings:
+            totals = self._accumulator.update(readings)
+            snapshot = {self.names.get(i, "if%d" % i): v
+                        for i, v in totals.items()}
+            with self._lock:
+                self._samples.append((stamp, snapshot))
+        else:
+            self.failures += 1
 
     def _loop(self) -> None:
         while not self._stop.is_set():
-            counters = snmp_counters(self.host, self.community, self.indexes,
-                                     port=self.port)
-            stamp = time.perf_counter() - self.origin
-            if counters:
-                snapshot = {self.names.get(i, "if%d" % i): v
-                            for i, v in counters.items()}
-                with self._lock:
-                    self._samples.append((stamp, snapshot))
-            else:
-                self.failures += 1
+            self.poll_once()
             self._stop.wait(self.interval)
 
     def start(self) -> None:

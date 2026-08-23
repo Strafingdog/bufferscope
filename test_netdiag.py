@@ -1959,5 +1959,195 @@ class TestNoCommunityLeak(unittest.TestCase):
         self.assertNotIn("community", blob)
 
 
+# --------------------------------------------------------------------------
+# COUNTER32 FALLBACK
+#
+# Cheap access points often implement only the 32-bit ifInOctets/ifOutOctets
+# counters. Those wrap about every 34 seconds at gigabit, which is why the
+# 64-bit ifHC counters are preferred - but a device that lacks them is
+# perfectly measurable as long as the wrap is corrected between samples.
+# --------------------------------------------------------------------------
+
+
+class TestUnwrapDelta(unittest.TestCase):
+    def test_normal_increase(self):
+        self.assertEqual(netdiag.unwrap_delta(100, 350, netdiag.COUNTER32_MODULUS), 250)
+
+    def test_no_change(self):
+        self.assertEqual(netdiag.unwrap_delta(100, 100, netdiag.COUNTER32_MODULUS), 0)
+
+    def test_single_wrap_is_corrected(self):
+        m = netdiag.COUNTER32_MODULUS
+        # 1000 bytes before the wrap, 500 after it
+        self.assertEqual(netdiag.unwrap_delta(m - 1000, 500, m), 1500)
+
+    def test_wrap_at_exact_boundary(self):
+        m = netdiag.COUNTER32_MODULUS
+        self.assertEqual(netdiag.unwrap_delta(m - 1, 0, m), 1)
+
+    def test_counter_reset_is_reported_as_zero_not_as_a_spike(self):
+        # A device reboot sets the counter to a small value. Adding a modulus
+        # would invent ~4 GB of traffic that never happened, so an implausible
+        # delta must be discarded rather than reported.
+        m = netdiag.COUNTER32_MODULUS
+        self.assertEqual(netdiag.unwrap_delta(3_000_000_000, 5, m, max_delta=10_000_000), 0)
+
+    def test_plausible_wrap_survives_the_max_delta_guard(self):
+        m = netdiag.COUNTER32_MODULUS
+        self.assertEqual(netdiag.unwrap_delta(m - 1000, 500, m, max_delta=10_000_000), 1500)
+
+    def test_64bit_counters_use_their_own_modulus(self):
+        m = netdiag.COUNTER64_MODULUS
+        self.assertEqual(netdiag.unwrap_delta(m - 10, 5, m), 15)
+
+
+class TestCounterReadings(unittest.TestCase):
+    """snmp_counter_readings must prefer 64-bit counters and fall back to the
+    32-bit pair on devices that do not implement them, reporting which modulus
+    applies so a wrap can be corrected later."""
+
+    def _fake_query(self, hc_values, legacy_values):
+        """Stand in for snmp_query, answering by which OID subtree is asked."""
+        def query(host, community, oids, next_request=False, timeout=2.0, port=161):
+            values = hc_values if oids[0].startswith(netdiag.OID_IF_HC_IN) else legacy_values
+            if values is None:
+                return None
+            return {"error_status": 0,
+                    "varbinds": list(zip(oids, values))}
+        return query
+
+    def _run(self, hc_values, legacy_values):
+        original = netdiag.snmp_query
+        netdiag.snmp_query = self._fake_query(hc_values, legacy_values)
+        try:
+            return netdiag.snmp_counter_readings("192.0.2.1", "community", [3])
+        finally:
+            netdiag.snmp_query = original
+
+    def test_prefers_64bit_when_available(self):
+        out = self._run([111, 222], [7, 8])
+        self.assertEqual(out[3], (111, 222, netdiag.COUNTER64_MODULUS))
+
+    def test_falls_back_to_32bit_when_hc_returns_null(self):
+        # Some access points answer ifHCInOctets with a bare NULL rather
+        # than noSuchObject, which the parser surfaces as None.
+        out = self._run([None, None], [4321, 8765])
+        self.assertEqual(out[3], (4321, 8765, netdiag.COUNTER32_MODULUS))
+
+    def test_falls_back_when_hc_reports_no_such_object(self):
+        out = self._run(["noSuchObject", "noSuchObject"], [10, 20])
+        self.assertEqual(out[3], (10, 20, netdiag.COUNTER32_MODULUS))
+
+    def test_falls_back_when_hc_request_times_out(self):
+        out = self._run(None, [10, 20])
+        self.assertEqual(out[3], (10, 20, netdiag.COUNTER32_MODULUS))
+
+    def test_index_absent_when_neither_counter_exists(self):
+        self.assertEqual(self._run([None, None], [None, None]), {})
+
+    def test_snmp_counters_keeps_its_two_tuple_contract(self):
+        # Existing callers must be unaffected by the added modulus.
+        original = netdiag.snmp_query
+        netdiag.snmp_query = self._fake_query([111, 222], [7, 8])
+        try:
+            self.assertEqual(netdiag.snmp_counters("192.0.2.1", "c", [3]), {3: (111, 222)})
+        finally:
+            netdiag.snmp_query = original
+
+
+class TestCounterAccumulator(unittest.TestCase):
+    """throughput_in_window subtracts the first sample from the last, so a
+    counter that wraps mid-window would read as a decrease and be clamped to
+    zero. The accumulator converts raw readings into monotonic totals first."""
+
+    def test_first_reading_is_the_zero_point(self):
+        acc = netdiag.CounterAccumulator()
+        self.assertEqual(acc.update({1: (5000, 9000, netdiag.COUNTER32_MODULUS)}),
+                         {1: (0, 0)})
+
+    def test_totals_accumulate(self):
+        acc = netdiag.CounterAccumulator()
+        m = netdiag.COUNTER32_MODULUS
+        acc.update({1: (1000, 2000, m)})
+        self.assertEqual(acc.update({1: (1500, 2200, m)}), {1: (500, 200)})
+        self.assertEqual(acc.update({1: (1800, 2600, m)}), {1: (800, 600)})
+
+    def test_wrap_keeps_the_total_rising(self):
+        acc = netdiag.CounterAccumulator()
+        m = netdiag.COUNTER32_MODULUS
+        acc.update({1: (m - 1000, m - 500, m)})
+        self.assertEqual(acc.update({1: (500, 1500, m)}), {1: (1500, 2000)})
+
+    def test_wrap_does_not_look_like_a_decrease(self):
+        acc = netdiag.CounterAccumulator()
+        m = netdiag.COUNTER32_MODULUS
+        first = acc.update({1: (m - 100, m - 100, m)})[1][0]
+        second = acc.update({1: (900, 900, m)})[1][0]
+        self.assertGreater(second, first)
+
+    def test_reset_is_absorbed_rather_than_reported_as_a_spike(self):
+        acc = netdiag.CounterAccumulator(max_delta=1_000_000)
+        m = netdiag.COUNTER32_MODULUS
+        acc.update({1: (3_000_000_000, 3_000_000_000, m)})
+        self.assertEqual(acc.update({1: (5, 5, m)}), {1: (0, 0)})
+
+    def test_independent_interfaces_do_not_interfere(self):
+        acc = netdiag.CounterAccumulator()
+        m = netdiag.COUNTER64_MODULUS
+        acc.update({1: (100, 100, m), 2: (5000, 5000, m)})
+        self.assertEqual(acc.update({1: (150, 160, m), 2: (5001, 5002, m)}),
+                         {1: (50, 60), 2: (1, 2)})
+
+    def test_interface_appearing_late_starts_from_its_own_zero(self):
+        acc = netdiag.CounterAccumulator()
+        m = netdiag.COUNTER64_MODULUS
+        acc.update({1: (100, 100, m)})
+        out = acc.update({1: (200, 200, m), 2: (77, 88, m)})
+        self.assertEqual(out[2], (0, 0))
+        self.assertEqual(out[1], (100, 100))
+
+
+class TestRouterSamplerWrapHandling(unittest.TestCase):
+    """A 32-bit counter wraps every ~34 s at gigabit. A sampler that stored
+    raw readings would report that window as zero throughput."""
+
+    def _sampler_over(self, readings_series, names={1: "LAN"}):
+        original = netdiag.snmp_counter_readings
+        series = list(readings_series)
+        def fake(host, community, indexes, timeout=2.0, port=161):
+            return series.pop(0) if series else {}
+        netdiag.snmp_counter_readings = fake
+        try:
+            sampler = netdiag.RouterSampler("192.0.2.1", "community", [1],
+                                            names, origin=0.0)
+            for i in range(len(readings_series)):
+                sampler.poll_once(stamp=float(i))
+            return sampler
+        finally:
+            netdiag.snmp_counter_readings = original
+
+    def test_counters_rise_across_a_wrap(self):
+        m = netdiag.COUNTER32_MODULUS
+        s = self._sampler_over([{1: (m - 1000, 0, m)}, {1: (500, 0, m)}])
+        values = [snap["LAN"][0] for _stamp, snap in s.samples()]
+        self.assertEqual(values, [0, 1500])
+
+    def test_throughput_across_a_wrap_is_measured_not_lost(self):
+        # 100 Mbps = 12.5 MB/s. Three one-second samples straddling a wrap.
+        m = netdiag.COUNTER32_MODULUS
+        step = 12_500_000
+        start = m - step // 2          # wraps between sample 1 and 2
+        readings = [{1: ((start + i * step) % m, 0, m)} for i in range(3)]
+        s = self._sampler_over(readings)
+        down, _up = netdiag.throughput_in_window(s.samples(), 0.0, 2.0)
+        self.assertAlmostEqual(down, 100.0, delta=0.1)
+
+    def test_64bit_devices_are_unaffected(self):
+        m = netdiag.COUNTER64_MODULUS
+        s = self._sampler_over([{1: (1_000, 0, m)}, {1: (1_000 + 12_500_000, 0, m)}])
+        down, _up = netdiag.throughput_in_window(s.samples(), 0.0, 1.0)
+        self.assertAlmostEqual(down, 100.0, delta=0.1)
+
+
 if __name__ == "__main__":
     unittest.main()
