@@ -2586,6 +2586,36 @@ def _measure_once(args: "argparse.Namespace"):
     return result
 
 
+def _aggregate_doc(runs: List[Dict[str, Any]], repeat: int, started_at: str,
+                   abort_reason: Optional[str] = None) -> Dict[str, Any]:
+    """Build the repeated-run document from however many runs completed.
+
+    Split out so an aborted arm is written the same way a complete one is.
+    """
+    agg = aggregate_runs(runs)
+    doc = {
+        "schema_version": SCHEMA_VERSION,
+        "netdiag_version": VERSION,
+        "started_at": started_at,
+        "env": runs[0].get("env") if runs else {},
+        "repeat": {"n": repeat, "completed": len(runs),
+                   "aborted": abort_reason is not None},
+        "runs": runs,
+        "aggregate": agg,
+    }
+    reasons = []
+    if abort_reason:
+        reasons.append("aborted after %d of %d runs: %s"
+                       % (len(runs), repeat, abort_reason))
+    if agg.get("excluded_runs"):
+        reasons.append("%d of %d runs were untrustworthy and excluded"
+                       % (agg["excluded_runs"], len(runs)))
+    if agg.get("included_runs", 0) < 2:
+        reasons.append("fewer than 2 usable runs: no error bars possible")
+    doc["validation"] = {"trustworthy": not reasons, "reasons": reasons}
+    return doc
+
+
 def cmd_measure(args: "argparse.Namespace") -> int:
     repeat = max(1, getattr(args, "repeat", 1) or 1)
     if args.command == "probe" or repeat == 1:
@@ -2620,25 +2650,13 @@ def cmd_measure(args: "argparse.Namespace") -> int:
             detail = result.get("speedtest_error") or "no loaded phase recorded"
             print("error: aborting after %d consecutive failed runs: %s"
                   % (consecutive_failures, detail), file=sys.stderr)
+            # The completed runs are not suspect and cost minutes each. Save
+            # them so an arm cut short by rate limiting is still usable.
+            doc = _aggregate_doc(runs, repeat, started_at, detail)
+            _emit(doc, args, render_aggregate(doc))
             return EXIT_ERROR
 
-    agg = aggregate_runs(runs)
-    doc = {
-        "schema_version": SCHEMA_VERSION,
-        "netdiag_version": VERSION,
-        "started_at": started_at,
-        "env": runs[0].get("env") if runs else {},
-        "repeat": {"n": repeat},
-        "runs": runs,
-        "aggregate": agg,
-    }
-    reasons = []
-    if agg.get("excluded_runs"):
-        reasons.append("%d of %d runs were untrustworthy and excluded"
-                       % (agg["excluded_runs"], repeat))
-    if agg.get("included_runs", 0) < 2:
-        reasons.append("fewer than 2 usable runs: no error bars possible")
-    doc["validation"] = {"trustworthy": not reasons, "reasons": reasons}
+    doc = _aggregate_doc(runs, repeat, started_at)
     _emit(doc, args, render_aggregate(doc))
     return EXIT_OK if doc["validation"]["trustworthy"] else EXIT_UNTRUSTWORTHY
 

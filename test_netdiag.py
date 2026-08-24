@@ -2151,3 +2151,116 @@ class TestRouterSamplerWrapHandling(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --------------------------------------------------------------------------
+# PARTIAL RESULTS ON ABORT
+# --------------------------------------------------------------------------
+
+
+class TestAbortSavesPartialResults(unittest.TestCase):
+    """A rate-limit abort must not discard the runs already completed.
+
+    Losing nine good runs because the tenth hit a server limit costs the whole
+    arm and cannot be recovered without re-measuring.
+    """
+
+    def setUp(self):
+        self._real_measure_once = netdiag._measure_once
+        self.addCleanup(setattr, netdiag, "_measure_once", self._real_measure_once)
+
+    @staticmethod
+    def _good_run(upload_mbps=900.0):
+        return {
+            "env": {"os": "test"},
+            "validation": {"trustworthy": True, "reasons": []},
+            "speedtest": {"upload_mbps": upload_mbps, "download_mbps": 940.0,
+                          "idle_latency_ms": 4.0, "packet_loss_pct": 0},
+            "phases": {
+                "idle": {"probes": {"ctrl": {"p95": 4.0, "n": 50}}},
+                "upload": {"probes": {"ctrl": {"p95": 30.0, "n": 50}}},
+            },
+        }
+
+    @staticmethod
+    def _failed_run():
+        return {
+            "env": {"os": "test"},
+            "validation": {"trustworthy": False, "reasons": ["speedtest failed"]},
+            "speedtest_error": "Limit reached",
+            "phases": {},
+        }
+
+    def _args(self, out):
+        return argparse.Namespace(command="bufferbloat", repeat=10, quiet=True,
+                                  out=out, json=False)
+
+    def _run_with(self, sequence, out):
+        calls = {"n": 0}
+
+        def fake(args):
+            index = calls["n"]
+            calls["n"] += 1
+            return sequence[index]
+
+        netdiag._measure_once = fake
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            code = netdiag.cmd_measure(self._args(out))
+        return code
+
+    def test_aborted_arm_still_writes_completed_runs(self):
+        sequence = [self._good_run(900.0), self._good_run(901.0),
+                    self._failed_run(), self._failed_run()]
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "arm.json")
+            code = self._run_with(sequence, out)
+            self.assertEqual(code, netdiag.EXIT_ERROR)
+            self.assertTrue(os.path.exists(out),
+                            "aborting discarded the completed runs")
+            doc = json.load(open(out))
+            self.assertEqual(doc["aggregate"]["included_runs"], 2)
+
+    def test_aborted_doc_records_the_abort_reason(self):
+        sequence = [self._good_run(), self._failed_run(), self._failed_run()]
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "arm.json")
+            self._run_with(sequence, out)
+            doc = json.load(open(out))
+            self.assertFalse(doc["validation"]["trustworthy"])
+            self.assertTrue(
+                any("Limit reached" in r for r in doc["validation"]["reasons"]),
+                "abort reason not recorded in validation: %r"
+                % (doc["validation"]["reasons"],))
+
+    def test_aborted_doc_records_attempted_and_completed_counts(self):
+        sequence = [self._good_run(), self._failed_run(), self._failed_run()]
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "arm.json")
+            self._run_with(sequence, out)
+            doc = json.load(open(out))
+            self.assertEqual(doc["repeat"]["n"], 10, "planned repeats")
+            self.assertEqual(doc["repeat"]["completed"], 3, "runs attempted")
+            self.assertTrue(doc["repeat"]["aborted"])
+
+    def test_normal_completion_is_not_marked_aborted(self):
+        sequence = [self._good_run(900.0 + i) for i in range(10)]
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "arm.json")
+            code = self._run_with(sequence, out)
+            self.assertEqual(code, netdiag.EXIT_OK)
+            doc = json.load(open(out))
+            self.assertFalse(doc["repeat"].get("aborted", False))
+            self.assertEqual(doc["aggregate"]["included_runs"], 10)
+
+    def test_abort_on_the_first_two_runs_does_not_crash(self):
+        # Rate limiting can strike immediately, leaving nothing worth
+        # aggregating. Rendering must still survive and write the document.
+        sequence = [self._failed_run(), self._failed_run()]
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "arm.json")
+            code = self._run_with(sequence, out)
+            self.assertEqual(code, netdiag.EXIT_ERROR)
+            doc = json.load(open(out))
+            self.assertEqual(doc["aggregate"]["included_runs"], 0)
+            self.assertEqual(doc["repeat"]["completed"], 2)
