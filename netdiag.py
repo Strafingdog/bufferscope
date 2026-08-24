@@ -1069,6 +1069,141 @@ def extract_result(events: List[Tuple[float, Dict[str, Any]]]) -> Dict[str, Any]
     }
 
 
+def find_librespeed() -> Optional[str]:
+    """Locate librespeed-cli. Mirrors find_speedtest so either generator works
+    from a plain install."""
+    for name in ("librespeed-cli", "librespeed"):
+        found = shutil.which(name)
+        if found:
+            return found
+    patterns: List[str] = []
+    if os.name == "nt":
+        local = os.environ.get("LOCALAPPDATA", "")
+        if local:
+            patterns.append(os.path.join(local, "Microsoft", "WinGet", "Links",
+                                         "librespeed-cli.exe"))
+            patterns.append(os.path.join(local, "Microsoft", "WinGet", "Packages",
+                                         "LibreSpeed.librespeed-cli*",
+                                         "librespeed-cli.exe"))
+    else:
+        patterns += ["/usr/bin/librespeed-cli", "/usr/local/bin/librespeed-cli",
+                     "/opt/homebrew/bin/librespeed-cli"]
+    for pattern in patterns:
+        for candidate in sorted(glob.glob(pattern)):
+            if os.path.exists(candidate):
+                return candidate
+    return None
+
+
+def parse_librespeed_json(text: str) -> Dict[str, Any]:
+    """Parse `librespeed-cli --json` into netdiag's canonical speedtest shape.
+
+    Two differences from Ookla worth knowing: librespeed reports Mbps directly
+    rather than bytes/sec, and it has no packet-loss metric at all.
+    """
+    blank = dict(EMPTY_SPEEDTEST)
+    try:
+        doc = json.loads(text)
+    except Exception:
+        return blank
+    if isinstance(doc, list):
+        doc = doc[0] if doc else None
+    if not isinstance(doc, dict):
+        return blank
+
+    def num(key: str) -> Optional[float]:
+        value = doc.get(key)
+        return float(value) if isinstance(value, (int, float)) else None
+
+    return {
+        "download_mbps": num("download"),
+        "upload_mbps": num("upload"),
+        "idle_latency_ms": num("ping"),
+        "packet_loss_pct": None,
+        "server": doc.get("server"),
+        "result_url": doc.get("share") or None,
+    }
+
+
+def merge_librespeed_results(download: Optional[Dict[str, Any]],
+                             upload: Optional[Dict[str, Any]]
+                             ) -> Dict[str, Any]:
+    """Join the two single-direction runs into one result.
+
+    Each run reports 0 for the direction it was told to skip, so every number
+    is taken only from the run that actually measured it. Reading the skipped
+    zero would silently report a dead link.
+    """
+    out = dict(EMPTY_SPEEDTEST)
+    if download:
+        out["download_mbps"] = download.get("download_mbps")
+        out["idle_latency_ms"] = download.get("idle_latency_ms")
+        out["server"] = download.get("server")
+        out["result_url"] = download.get("result_url")
+    if upload:
+        out["upload_mbps"] = upload.get("upload_mbps")
+        for key in ("idle_latency_ms", "server", "result_url"):
+            if out[key] is None:
+                out[key] = upload.get(key)
+    return out
+
+
+LIBRESPEED_DEFAULT_CONCURRENT = 8
+LIBRESPEED_DEFAULT_DURATION = 15
+
+
+def run_librespeed(binary: str,
+                   server_id: Optional[Any],
+                   on_phase: Any,
+                   origin: float,
+                   duration: int = LIBRESPEED_DEFAULT_DURATION,
+                   concurrent: int = LIBRESPEED_DEFAULT_CONCURRENT,
+                   error_sink: Optional[List[str]] = None
+                   ) -> Tuple[List[Tuple[str, float, float]], Dict[str, Any]]:
+    """Run librespeed once per direction, timing each phase directly.
+
+    Ookla's phase boundaries have to be inferred from its event stream. Here
+    each direction is a separate process, so the window is simply when we
+    started and stopped it - more precise, not less.
+
+    A direction that fails is omitted rather than recorded as zero, so a failed
+    upload cannot masquerade as a saturated link with no throughput.
+    """
+    phases: List[Tuple[str, float, float]] = []
+    parsed: Dict[str, Dict[str, Any]] = {}
+
+    for name, skip_flag in (("download", "--no-upload"),
+                            ("upload", "--no-download")):
+        cmd = [binary, "--json", skip_flag,
+               "--duration", str(duration),
+               "--concurrent", str(concurrent)]
+        if server_id:
+            cmd += ["--server", str(server_id)]
+        on_phase(name)
+        start = time.perf_counter() - origin
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=duration * 4 + 60)
+        except Exception as exc:
+            if error_sink is not None:
+                error_sink.append("librespeed %s failed: %s" % (name, exc))
+            continue
+        end = time.perf_counter() - origin
+        result = parse_librespeed_json(getattr(proc, "stdout", "") or "")
+        if result.get(name + "_mbps") is None:
+            if error_sink is not None:
+                stderr = (getattr(proc, "stderr", "") or "").strip()
+                error_sink.append(
+                    _summarise_speedtest_error(stderr) if stderr
+                    else "librespeed produced no %s result" % name)
+            continue
+        parsed[name] = result
+        phases.append((name, start, end))
+
+    return phases, merge_librespeed_results(parsed.get("download"),
+                                            parsed.get("upload"))
+
+
 def nic_delta_mbps(before: Dict[str, Tuple[int, int]],
                    after: Dict[str, Tuple[int, int]],
                    seconds: float) -> Tuple[float, float]:
@@ -2075,6 +2210,19 @@ def _add_common(parser: "argparse.ArgumentParser") -> None:
                         help="skip ICMP even when privileged")
     parser.add_argument("--quiet", action="store_true",
                         help="suppress progress output")
+    parser.add_argument("--generator", choices=("ookla", "librespeed"),
+                        default="ookla",
+                        help="load generator (default ookla). Arms measured "
+                             "with different generators are not comparable.")
+    parser.add_argument("--ls-concurrent", type=int,
+                        default=LIBRESPEED_DEFAULT_CONCURRENT, metavar="N",
+                        help="librespeed parallel streams (default %d); its own "
+                             "default of 3 does not saturate a gigabit line"
+                             % LIBRESPEED_DEFAULT_CONCURRENT)
+    parser.add_argument("--ls-duration", type=int,
+                        default=LIBRESPEED_DEFAULT_DURATION, metavar="SECS",
+                        help="librespeed per-direction duration (default %d)"
+                             % LIBRESPEED_DEFAULT_DURATION)
     parser.add_argument("--raw", action="store_true",
                         help="include the full latency sample series in the "
                              "JSON result (large; needed to re-analyse a run)")
@@ -2337,6 +2485,19 @@ def cmd_env(args: "argparse.Namespace") -> int:
     return EXIT_OK
 
 
+def doc_generator(doc: Dict[str, Any]) -> str:
+    """Which load generator produced this document.
+
+    Arms measured before the generator was selectable were all Ookla, so a
+    missing field means ookla rather than unknown.
+    """
+    for run in (doc.get("runs") or []):
+        name = run.get("generator")
+        if name:
+            return str(name)
+    return str(doc.get("generator") or "ookla")
+
+
 def cmd_compare(args: "argparse.Namespace") -> int:
     docs = []
     for path in (args.file_a, args.file_b):
@@ -2354,6 +2515,14 @@ def cmd_compare(args: "argparse.Namespace") -> int:
         # invalidating measurements already taken.
         if doc.get("runs"):
             doc["aggregate"] = aggregate_runs(doc["runs"])
+    gen_a, gen_b = doc_generator(docs[0]), doc_generator(docs[1])
+    if gen_a != gen_b:
+        # Measured on this line minutes apart: Ookla gave download +3.9 ms /
+        # upload +26.5 ms, Waveform gave +11.3 / +3.6. Inverted. Latency
+        # numbers from two generators are not the same measurement.
+        print("WARNING: these runs used different load generators (%s vs %s). "
+              "Latency comparisons across generators are not meaningful; "
+              "throughput is more robust but still suspect.\n" % (gen_a, gen_b))
     if docs[0].get("aggregate") and docs[1].get("aggregate"):
         print(render_compare_aggregate(docs[0], docs[1]))
     else:
@@ -2512,12 +2681,22 @@ def _measure_once(args: "argparse.Namespace"):
         _emit(result, args, render_human(result))
         return EXIT_OK if result["validation"]["trustworthy"] else EXIT_UNTRUSTWORTHY
 
-    binary = find_speedtest()
-    if not binary:
-        print("error: Ookla Speedtest CLI not found. Install it from "
-              "https://www.speedtest.net/apps/cli and ensure 'speedtest' is "
-              "on PATH.", file=sys.stderr)
-        return EXIT_ERROR
+    generator = getattr(args, "generator", "ookla")
+    if generator == "librespeed":
+        binary = find_librespeed()
+        if not binary:
+            print("error: librespeed-cli not found. Install it with "
+                  "'winget install LibreSpeed.librespeed-cli' or from "
+                  "https://github.com/librespeed/speedtest-cli and ensure "
+                  "'librespeed-cli' is on PATH.", file=sys.stderr)
+            return EXIT_ERROR
+    else:
+        binary = find_speedtest()
+        if not binary:
+            print("error: Ookla Speedtest CLI not found. Install it from "
+                  "https://www.speedtest.net/apps/cli and ensure 'speedtest' is "
+                  "on PATH.", file=sys.stderr)
+            return EXIT_ERROR
 
     runner = ProbeRunner(probes, args.probe_interval)
     runner.start()
@@ -2537,9 +2716,23 @@ def _measure_once(args: "argparse.Namespace"):
             print("  ... %s phase" % kind, file=sys.stderr)
 
     speedtest_errors: List[str] = []
-    events = run_speedtest(binary, getattr(args, "server_id", None),
-                           on_event, runner.origin(),
-                           error_sink=speedtest_errors)
+    if generator == "librespeed":
+        def on_phase(name: str) -> None:
+            if not args.quiet:
+                print("  ... %s phase" % name, file=sys.stderr)
+
+        events = []
+        ls_phases, speed_result = run_librespeed(
+            binary, getattr(args, "server_id", None), on_phase, runner.origin(),
+            duration=getattr(args, "ls_duration", LIBRESPEED_DEFAULT_DURATION),
+            concurrent=getattr(args, "ls_concurrent",
+                               LIBRESPEED_DEFAULT_CONCURRENT),
+            error_sink=speedtest_errors)
+    else:
+        ls_phases = None
+        events = run_speedtest(binary, getattr(args, "server_id", None),
+                               on_event, runner.origin(),
+                               error_sink=speedtest_errors)
     nic.stop()
     if router:
         router.stop()
@@ -2548,16 +2741,25 @@ def _measure_once(args: "argparse.Namespace"):
     all_samples = runner.samples()
     idle = {name: [s for s in series if s[0] < baseline_secs]
             for name, series in all_samples.items()}
-    phases = phases_from_events(
-        events, end_time=max((t for t, _ in events), default=0.0))
+    if ls_phases is not None:
+        # librespeed runs one process per direction, so the windows are exact
+        # rather than inferred from an event stream.
+        phases = ls_phases
+    else:
+        phases = phases_from_events(
+            events, end_time=max((t for t, _ in events), default=0.0))
+        speed_result = extract_result(events)
     buckets = bucket_samples(all_samples, phases)
     nic_samples = nic.samples()
     throughput = {name: throughput_in_window(nic_samples, start, end)
                   for name, start, end in phases}
 
-    result = build_result(env, extract_result(events), buckets, idle,
+    result = build_result(env, speed_result, buckets, idle,
                           throughput, started_at, mode=args.command,
                           keep_samples=getattr(args, "raw", False))
+    # Stamp provenance: comparing arms across generators is invalid, and a run
+    # with no record of how it was measured cannot be checked for that later.
+    result["generator"] = generator
     if speedtest_errors:
         result["speedtest_error"] = speedtest_errors[0]
         result["validation"] = validate_run(result)

@@ -2264,3 +2264,199 @@ class TestAbortSavesPartialResults(unittest.TestCase):
             doc = json.load(open(out))
             self.assertEqual(doc["aggregate"]["included_runs"], 0)
             self.assertEqual(doc["repeat"]["completed"], 2)
+
+
+# --------------------------------------------------------------------------
+# LIBRESPEED GENERATOR
+# --------------------------------------------------------------------------
+
+
+# Captured verbatim from librespeed-cli 1.0.14 --json --no-upload.
+LIBRESPEED_DOWNLOAD_JSON = (
+    '[{"timestamp":"2026-08-24T21:03:22.9390035+01:00",'
+    '"server":{"name":"London, England (Clouvider)",'
+    '"url":"https://lon.speedtest.clouvider.net/backend"},'
+    '"client":{"ip":"","hostname":"","city":""},'
+    '"bytes_sent":0,"bytes_received":1777276739,'
+    '"ping":3.59,"jitter":0.56,"upload":0,"download":911.35,"share":""}]'
+)
+
+LIBRESPEED_UPLOAD_JSON = (
+    '[{"timestamp":"2026-08-24T21:05:10.1000000+01:00",'
+    '"server":{"name":"London, England (Clouvider)",'
+    '"url":"https://lon.speedtest.clouvider.net/backend"},'
+    '"client":{"ip":""},'
+    '"bytes_sent":1600000000,"bytes_received":0,'
+    '"ping":4.10,"jitter":0.61,"upload":903.20,"download":0,'
+    '"share":"https://libre.sh/x.png"}]'
+)
+
+
+class TestParseLibrespeedJson(unittest.TestCase):
+    def test_parses_real_download_output(self):
+        out = netdiag.parse_librespeed_json(LIBRESPEED_DOWNLOAD_JSON)
+        self.assertAlmostEqual(out["download_mbps"], 911.35)
+        self.assertAlmostEqual(out["idle_latency_ms"], 3.59)
+        self.assertEqual(out["server"]["name"], "London, England (Clouvider)")
+
+    def test_empty_share_becomes_none_not_empty_string(self):
+        out = netdiag.parse_librespeed_json(LIBRESPEED_DOWNLOAD_JSON)
+        self.assertIsNone(out["result_url"])
+
+    def test_share_url_is_kept_when_present(self):
+        out = netdiag.parse_librespeed_json(LIBRESPEED_UPLOAD_JSON)
+        self.assertEqual(out["result_url"], "https://libre.sh/x.png")
+
+    def test_packet_loss_is_none_because_librespeed_does_not_report_it(self):
+        out = netdiag.parse_librespeed_json(LIBRESPEED_DOWNLOAD_JSON)
+        self.assertIsNone(out["packet_loss_pct"])
+
+    def test_garbage_yields_all_none_rather_than_raising(self):
+        for text in ("", "not json", "[]", "null"):
+            out = netdiag.parse_librespeed_json(text)
+            self.assertIsNone(out["download_mbps"], text)
+            self.assertIsNone(out["upload_mbps"], text)
+
+    def test_accepts_a_bare_object_as_well_as_a_list(self):
+        out = netdiag.parse_librespeed_json('{"download":500.0,"ping":9.0}')
+        self.assertAlmostEqual(out["download_mbps"], 500.0)
+
+
+class TestMergeLibrespeedResults(unittest.TestCase):
+    """Each direction is measured in its own process, so the halves are joined."""
+
+    def _down(self):
+        return netdiag.parse_librespeed_json(LIBRESPEED_DOWNLOAD_JSON)
+
+    def _up(self):
+        return netdiag.parse_librespeed_json(LIBRESPEED_UPLOAD_JSON)
+
+    def test_takes_each_direction_from_its_own_run(self):
+        out = netdiag.merge_librespeed_results(self._down(), self._up())
+        self.assertAlmostEqual(out["download_mbps"], 911.35)
+        self.assertAlmostEqual(out["upload_mbps"], 903.20)
+
+    def test_zero_from_the_skipped_direction_is_never_used(self):
+        # The download run reports upload:0 because it did not run one.
+        # Taking that zero would silently report a dead uplink.
+        out = netdiag.merge_librespeed_results(self._down(), self._up())
+        self.assertNotEqual(out["upload_mbps"], 0)
+
+    def test_missing_upload_run_leaves_upload_none(self):
+        out = netdiag.merge_librespeed_results(self._down(), None)
+        self.assertAlmostEqual(out["download_mbps"], 911.35)
+        self.assertIsNone(out["upload_mbps"])
+
+    def test_result_has_exactly_the_canonical_speedtest_keys(self):
+        out = netdiag.merge_librespeed_results(self._down(), self._up())
+        self.assertEqual(set(out), set(netdiag.EMPTY_SPEEDTEST))
+
+
+class TestRunLibrespeed(unittest.TestCase):
+    """librespeed has no phase event stream, so each direction is its own run."""
+
+    def setUp(self):
+        self._real_run = netdiag.subprocess.run
+        self.addCleanup(setattr, netdiag.subprocess, "run", self._real_run)
+        self.calls = []
+
+    class _Completed:
+        def __init__(self, stdout, stderr="", returncode=0):
+            self.stdout, self.stderr, self.returncode = stdout, stderr, returncode
+
+    def _stub(self, down=LIBRESPEED_DOWNLOAD_JSON, up=LIBRESPEED_UPLOAD_JSON):
+        def fake(cmd, **kwargs):
+            self.calls.append(list(cmd))
+            if "--no-download" in cmd:
+                return self._Completed(up if up is not None else "")
+            return self._Completed(down if down is not None else "")
+        netdiag.subprocess.run = fake
+
+    def _go(self, **kw):
+        return netdiag.run_librespeed("ls-bin", kw.pop("server_id", None),
+                                      lambda name: None, time.perf_counter(), **kw)
+
+    def test_runs_download_then_upload_as_separate_processes(self):
+        self._stub()
+        phases, _ = self._go()
+        self.assertEqual([p[0] for p in phases], ["download", "upload"])
+        self.assertEqual(len(self.calls), 2)
+        self.assertIn("--no-upload", self.calls[0])
+        self.assertIn("--no-download", self.calls[1])
+
+    def test_phase_windows_are_ordered_and_non_overlapping(self):
+        self._stub()
+        phases, _ = self._go()
+        (_, d_start, d_end), (_, u_start, u_end) = phases
+        self.assertLessEqual(d_start, d_end)
+        self.assertLessEqual(d_end, u_start)
+        self.assertLessEqual(u_start, u_end)
+
+    def test_each_direction_is_taken_from_its_own_run(self):
+        self._stub()
+        _, result = self._go()
+        self.assertAlmostEqual(result["download_mbps"], 911.35)
+        self.assertAlmostEqual(result["upload_mbps"], 903.20)
+
+    def test_server_id_and_tuning_flags_are_passed_through(self):
+        self._stub()
+        self._go(server_id=42, duration=20, concurrent=12)
+        self.assertIn("--server", self.calls[0])
+        self.assertIn("42", self.calls[0])
+        self.assertIn("20", self.calls[0])
+        self.assertIn("12", self.calls[0])
+
+    def test_a_failed_direction_is_reported_and_omitted_not_zeroed(self):
+        self._stub(up="")           # upload run produced nothing
+        errors = []
+        phases, result = netdiag.run_librespeed(
+            "ls-bin", None, lambda n: None, time.perf_counter(),
+            error_sink=errors)
+        self.assertEqual([p[0] for p in phases], ["download"])
+        self.assertIsNone(result["upload_mbps"])
+        self.assertTrue(errors, "a failed direction must be reported")
+
+
+class TestGeneratorProvenance(unittest.TestCase):
+    """Comparing arms measured by different load generators is invalid:
+    the same line gave inverted up/down latency under Ookla vs Waveform."""
+
+    @staticmethod
+    def _doc(generator):
+        run = {
+            "env": {"os": "test"},
+            "validation": {"trustworthy": True, "reasons": []},
+            "speedtest": {"upload_mbps": 900.0, "download_mbps": 940.0},
+            "phases": {"idle": {"probes": {}}, "upload": {"probes": {}}},
+        }
+        if generator is not None:
+            run["generator"] = generator
+        return {"schema_version": netdiag.SCHEMA_VERSION, "runs": [run, dict(run)],
+                "repeat": {"n": 2}}
+
+    def test_reads_generator_from_runs(self):
+        self.assertEqual(netdiag.doc_generator(self._doc("librespeed")), "librespeed")
+
+    def test_legacy_doc_without_the_field_is_ookla(self):
+        # Every arm measured before this feature existed was Ookla.
+        self.assertEqual(netdiag.doc_generator(self._doc(None)), "ookla")
+
+    def test_compare_warns_when_generators_differ(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = os.path.join(tmp, "a.json"), os.path.join(tmp, "b.json")
+            json.dump(self._doc("ookla"), open(a, "w"))
+            json.dump(self._doc("librespeed"), open(b, "w"))
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                netdiag.cmd_compare(argparse.Namespace(file_a=a, file_b=b))
+            self.assertIn("different load generators", buf.getvalue())
+
+    def test_compare_is_silent_when_generators_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = os.path.join(tmp, "a.json"), os.path.join(tmp, "b.json")
+            json.dump(self._doc("ookla"), open(a, "w"))
+            json.dump(self._doc("ookla"), open(b, "w"))
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                netdiag.cmd_compare(argparse.Namespace(file_a=a, file_b=b))
+            self.assertNotIn("different load generators", buf.getvalue())
