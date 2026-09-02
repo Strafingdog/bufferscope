@@ -113,6 +113,18 @@ upload   [NIC 867 Mbps]
 Bufferbloat: worst added p95 22.12 ms  ->  grade A
 ```
 
+### `classes` - check that QoS rules match the traffic you think they do
+
+```
+$ python bufferscope.py classes
+```
+
+Runs the same loaded measurement as `bufferbloat`, but with a preset of probes
+chosen to land in different QoS classes - DNS, a STUN port a conferencing app
+would use, and a control probe on a port no rule should match. If a rule works,
+the probes it covers stay low while the control probe suffers. See
+[Verifying classification rules](#verifying-classification-rules).
+
 ### `probe` - latency only, generates no load
 
 ```
@@ -785,6 +797,15 @@ throughput timeline instead of the load generator's own phase claims.
     "overall_grade"
   },
   "validation": {"trustworthy": bool, "reasons": [str]},
+  "observed_throughput":  // what was actually flowing during a passive run,
+    {"down_mbps", "up_mbps", "seconds", "samples"},
+                          // null when too few NIC samples to measure
+  "router_throughput":    // the same, from the router, with --router-snmp
+    {"down_mbps", "up_mbps", "seconds", "sample_count",
+     "counter_transitions", "refresh_interval_s",
+     "interface", "source": "snmp",
+     "note"},             // present, with null rates, when the window was
+                          // too short for that router's refresh rate
   "marking": [            // one entry per marked probe
     {"probe", "dscp", "name",
      "applied"}          // false when the OS refused the mark
