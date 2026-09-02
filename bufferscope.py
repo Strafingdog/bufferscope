@@ -498,6 +498,67 @@ def parse_gateway_macos(text: str) -> Optional[str]:
     return None
 
 
+def _is_ipv6(text: str) -> bool:
+    try:
+        socket.inet_pton(socket.AF_INET6, (text or "").split("%")[0])
+        return True
+    except Exception:
+        return False
+
+
+def _scoped(address: str, zone: Optional[str]) -> str:
+    """Attach a scope to a link-local address, which is useless without one."""
+    if not zone or "%" in address:
+        return address
+    return "%s%%%s" % (address, zone) if address.lower().startswith("fe8") \
+        else address
+
+
+def parse_gateway6_windows(text: str) -> Optional[str]:
+    """Parse CSV from Get-NetRoute for ::/0; prefer the lowest RouteMetric."""
+    best: Optional[Tuple[int, str]] = None
+    for row in _rows(text):
+        hop = (row.get("NextHop") or "").strip()
+        if not _is_ipv6(hop) or hop in ("::", ""):
+            continue
+        try:
+            metric = int((row.get("RouteMetric") or "0").strip())
+        except ValueError:
+            metric = 0
+        hop = _scoped(hop, (row.get("ifIndex") or "").strip() or None)
+        if best is None or metric < best[0]:
+            best = (metric, hop)
+    return best[1] if best else None
+
+
+def parse_gateway6_linux(text: str) -> Optional[str]:
+    """Parse /proc/net/ipv6_route: the default route is :: with prefixlen 0."""
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 10:
+            continue
+        dest, prefixlen, nexthop, device = parts[0], parts[1], parts[4], parts[-1]
+        if len(dest) != 32 or set(dest) != {"0"} or prefixlen != "00":
+            continue
+        if len(nexthop) != 32 or set(nexthop) == {"0"}:
+            continue
+        try:
+            address = socket.inet_ntop(socket.AF_INET6, bytes.fromhex(nexthop))
+        except Exception:
+            continue
+        return _scoped(address, device)
+    return None
+
+
+def parse_gateway6_macos(text: str) -> Optional[str]:
+    """Parse netstat -rn for the IPv6 default route, scope included."""
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "default" and _is_ipv6(parts[1]):
+            return parts[1]
+    return None
+
+
 def parse_nic_windows(text: str) -> Dict[str, Tuple[int, int]]:
     out: Dict[str, Tuple[int, int]] = {}
     for row in _rows(text):
@@ -565,6 +626,10 @@ _WIN_ROUTE_CMD = _PS + [
     "Get-NetRoute -DestinationPrefix 0.0.0.0/0 | "
     "Select-Object NextHop,RouteMetric | ConvertTo-Csv -NoTypeInformation"
 ]
+_WIN_ROUTE6_CMD = _PS + [
+    "Get-NetRoute -DestinationPrefix ::/0 | "
+    "Select-Object NextHop,RouteMetric,ifIndex | ConvertTo-Csv -NoTypeInformation"
+]
 _WIN_NIC_CMD = _PS + [
     "Get-NetAdapterStatistics | Select-Object Name,ReceivedBytes,SentBytes | "
     "ConvertTo-Csv -NoTypeInformation"
@@ -601,6 +666,30 @@ def detect_gateway() -> Optional[str]:
         if system == "Darwin":
             out = run_cmd(["netstat", "-rn"])
             return parse_gateway_macos(out) if out else None
+    except Exception:
+        return None
+    return None
+
+
+def detect_gateway6() -> Optional[str]:
+    """Find the IPv6 default gateway. Returns None rather than raising."""
+    system = platform.system()
+    try:
+        if system == "Windows":
+            out = run_cmd(_WIN_ROUTE6_CMD)
+            return parse_gateway6_windows(out) if out else None
+        if system == "Linux":
+            out = run_cmd(["cat", "/proc/net/ipv6_route"])
+            if out is None:
+                try:
+                    with open("/proc/net/ipv6_route", "r") as handle:
+                        out = handle.read()
+                except OSError:
+                    return None
+            return parse_gateway6_linux(out) if out else None
+        if system == "Darwin":
+            out = run_cmd(["netstat", "-rn", "-f", "inet6"])
+            return parse_gateway6_macos(out) if out else None
     except Exception:
         return None
     return None
@@ -689,6 +778,7 @@ def collect_env() -> Dict[str, Any]:
         "bufferscope_version": VERSION,
         "schema_version": SCHEMA_VERSION,
         "gateway": detect_gateway(),
+        "gateway6": detect_gateway6(),
         "interfaces": {k: {"rx_bytes": v[0], "tx_bytes": v[1]}
                        for k, v in read_nic_counters().items()},
         "speedtest_path": redact_path(binary),
@@ -729,13 +819,56 @@ def dscp_to_tos(dscp: int) -> int:
     return (dscp & 0x3F) << 2
 
 
-def _apply_dscp(sock: "socket.socket", dscp: Optional[int]) -> None:
+# Linux and Windows number the IPv6 traffic class option differently, and
+# Python only exposes it where the platform headers declared it.
+IPV6_TCLASS = getattr(socket, "IPV6_TCLASS", 39 if os.name == "nt" else 67)
+
+
+def dscp_name(value: int) -> str:
+    """The conventional name for a DSCP value, or a numeric stand-in."""
+    for name, number in _DSCP_NAMES.items():
+        if number == value and name != "default":
+            return name
+    return "dscp%d" % value
+
+
+def apply_dscp(sock: "socket.socket", dscp: Optional[int],
+               family: int = socket.AF_INET) -> Optional[bool]:
+    """Mark a socket and read the value back. None when nothing was asked for.
+
+    Windows routinely ignores IP_TOS unless a QoS policy grants it, and it does
+    so without raising. Assuming the mark took would produce a latency
+    comparison that cannot speak to the router's classification at all, so what
+    the socket actually holds is measured rather than assumed.
+    """
     if dscp is None:
-        return
+        return None
+    if family == socket.AF_INET6:
+        level, option = socket.IPPROTO_IPV6, IPV6_TCLASS
+    else:
+        level, option = socket.IPPROTO_IP, socket.IP_TOS
+    wanted = dscp_to_tos(dscp)
     try:
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, dscp_to_tos(dscp))
+        sock.setsockopt(level, option, wanted)
     except Exception:
-        pass  # some platforms refuse; the probe is still valid, just unmarked
+        return False
+    try:
+        return int(sock.getsockopt(level, option)) == wanted
+    except Exception:
+        return False
+
+
+def marking_report(probes: List["Probe"]) -> List[Dict[str, Any]]:
+    """What each marked probe asked for, and whether the OS honoured it."""
+    report = []
+    for probe in probes:
+        dscp = getattr(probe, "dscp", None)
+        if dscp is None:
+            continue
+        report.append({"probe": probe.name, "dscp": dscp,
+                       "name": dscp_name(dscp),
+                       "applied": getattr(probe, "dscp_applied", None)})
+    return report
 
 
 def _dscp_suffix(dscp: Optional[int]) -> str:
@@ -748,11 +881,52 @@ def _dscp_suffix(dscp: Optional[int]) -> str:
     return "@dscp%d" % dscp
 
 
+FAMILY_CHOICES = {"auto": socket.AF_UNSPEC, "4": socket.AF_INET,
+                  "6": socket.AF_INET6}
+
+
+def host_label(host: str) -> str:
+    """Bracket an IPv6 literal so a probe name can be parsed back."""
+    return "[%s]" % host if ":" in (host or "") else host
+
+
+def resolve_endpoint(host: str, port: int,
+                     family: int = socket.AF_UNSPEC,
+                     socktype: int = socket.SOCK_STREAM
+                     ) -> Tuple[int, Any]:
+    """The first address the OS offers, with the family it belongs to.
+
+    getaddrinfo applies the system address-selection order, so "auto" follows
+    the same preference as everything else on the host rather than inventing
+    one. Forcing a family that the target does not have raises, which is what
+    makes --family 6 a real check rather than a silent fallback to v4.
+    """
+    infos = socket.getaddrinfo(host, port, family, socktype)
+    if not infos:
+        raise OSError("no address for %s" % host)
+    return infos[0][0], infos[0][4]
+
+
 class Probe:
     """Base probe. Subclasses set `name` and implement `sample`."""
 
     name = "probe"
     dscp: Optional[int] = None
+    dscp_applied: Optional[bool] = None
+    family: int = socket.AF_UNSPEC
+
+    def _resolve(self, port: int, socktype: int) -> Tuple[int, Any]:
+        """Resolve once and keep it.
+
+        At 50 Hz a lookup per sample would measure the resolver rather than the
+        path, and pinning one address keeps every sample in a run pointed at
+        the same endpoint.
+        """
+        cached = getattr(self, "_endpoint", None)
+        if cached is None:
+            cached = resolve_endpoint(self.host, port, self.family, socktype)
+            self._endpoint = cached
+        return cached
 
     def sample(self) -> Optional[float]:
         raise NotImplementedError
@@ -767,15 +941,20 @@ class TcpProbe(Probe):
         self.port = port
         self.timeout = timeout
         self.dscp = dscp
-        self.name = "tcp:%s:%d%s" % (host, port, _dscp_suffix(dscp))
+        self.name = "tcp:%s:%d%s" % (host_label(host), port,
+                                     _dscp_suffix(dscp))
 
     def sample(self) -> Optional[float]:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            family, sockaddr = self._resolve(self.port, socket.SOCK_STREAM)
+        except Exception:
+            return None
+        sock = socket.socket(family, socket.SOCK_STREAM)
         sock.settimeout(self.timeout)
-        _apply_dscp(sock, self.dscp)
+        self.dscp_applied = apply_dscp(sock, self.dscp, family)
         start = time.perf_counter()
         try:
-            sock.connect((self.host, self.port))
+            sock.connect(sockaddr)
             return (time.perf_counter() - start) * 1000.0
         except Exception:
             return None
@@ -796,7 +975,7 @@ class UdpDnsProbe(Probe):
         self.timeout = timeout
         self.qname = qname
         self.dscp = dscp
-        self.name = "dns:%s%s" % (host, _dscp_suffix(dscp))
+        self.name = "dns:%s%s" % (host_label(host), _dscp_suffix(dscp))
 
     def _query(self, txid: int) -> bytes:
         header = struct.pack(">HHHHHH", txid, 0x0100, 1, 0, 0, 0)
@@ -808,12 +987,16 @@ class UdpDnsProbe(Probe):
 
     def sample(self) -> Optional[float]:
         txid = random.randint(0, 0xFFFF)
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            family, sockaddr = self._resolve(self.port, socket.SOCK_DGRAM)
+        except Exception:
+            return None
+        sock = socket.socket(family, socket.SOCK_DGRAM)
         sock.settimeout(self.timeout)
-        _apply_dscp(sock, self.dscp)
+        self.dscp_applied = apply_dscp(sock, self.dscp, family)
         start = time.perf_counter()
         try:
-            sock.sendto(self._query(txid), (self.host, self.port))
+            sock.sendto(self._query(txid), sockaddr)
             while True:
                 data, _ = sock.recvfrom(2048)
                 if len(data) >= 2 and struct.unpack(">H", data[:2])[0] == txid:
@@ -843,7 +1026,8 @@ class StunProbe(Probe):
         self.port = port
         self.timeout = timeout
         self.dscp = dscp
-        self.name = "stun:%s:%d%s" % (host, port, _dscp_suffix(dscp))
+        self.name = "stun:%s:%d%s" % (host_label(host), port,
+                                      _dscp_suffix(dscp))
 
     def _request(self, txid: bytes) -> bytes:
         return struct.pack(">HH", 0x0001, 0) + self.MAGIC + txid
@@ -854,12 +1038,16 @@ class StunProbe(Probe):
 
     def sample(self) -> Optional[float]:
         txid = os.urandom(12)
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            family, sockaddr = self._resolve(self.port, socket.SOCK_DGRAM)
+        except Exception:
+            return None
+        sock = socket.socket(family, socket.SOCK_DGRAM)
         sock.settimeout(self.timeout)
-        _apply_dscp(sock, self.dscp)
+        self.dscp_applied = apply_dscp(sock, self.dscp, family)
         start = time.perf_counter()
         try:
-            sock.sendto(self._request(txid), (self.host, self.port))
+            sock.sendto(self._request(txid), sockaddr)
             while True:
                 data, _ = sock.recvfrom(2048)
                 if self._matches(data, txid):
@@ -881,7 +1069,7 @@ class IcmpProbe(Probe):
         self.host = host
         self.timeout = timeout
         self.dscp = dscp
-        self.name = "icmp:%s%s" % (host, _dscp_suffix(dscp))
+        self.name = "icmp:%s%s" % (host_label(host), _dscp_suffix(dscp))
         self._seq = 0
 
     @staticmethod
@@ -898,22 +1086,40 @@ class IcmpProbe(Probe):
     def sample(self) -> Optional[float]:
         self._seq = (self._seq + 1) & 0xFFFF
         ident = os.getpid() & 0xFFFF
-        header = struct.pack(">BBHHH", 8, 0, 0, ident, self._seq)
         payload = b"bufferscope-" + bytes(24)
-        checksum = self._checksum(header + payload)
-        packet = struct.pack(">BBHHH", 8, 0, checksum, ident, self._seq) + payload
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+            family, sockaddr = self._resolve(0, socket.SOCK_DGRAM)
+        except Exception:
+            return None
+        v6 = family == socket.AF_INET6
+        if v6:
+            # ICMPv6 checksums cover a pseudo-header the kernel is required to
+            # fill in for raw sockets, so it is left zero here.
+            echo, reply, proto = 128, 129, socket.IPPROTO_ICMPV6
+            packet = struct.pack(">BBHHH", echo, 0, 0, ident, self._seq) + payload
+        else:
+            echo, reply, proto = 8, 0, socket.IPPROTO_ICMP
+            header = struct.pack(">BBHHH", echo, 0, 0, ident, self._seq)
+            checksum = self._checksum(header + payload)
+            packet = (struct.pack(">BBHHH", echo, 0, checksum, ident, self._seq)
+                      + payload)
+        try:
+            sock = socket.socket(family, socket.SOCK_RAW, proto)
         except Exception:
             return None
         sock.settimeout(self.timeout)
+        apply_dscp(sock, self.dscp, family)
         start = time.perf_counter()
         try:
-            sock.sendto(packet, (self.host, 0))
+            sock.sendto(packet, sockaddr)
             while True:
                 data, _ = sock.recvfrom(1024)
-                if len(data) >= 28 and data[20] == 0:
-                    got_id, got_seq = struct.unpack(">HH", data[24:28])
+                # A raw IPv6 socket hands back the ICMPv6 message alone; the
+                # IPv4 one still carries the 20-byte IP header in front.
+                offset = 0 if v6 else 20
+                if len(data) >= offset + 8 and data[offset] == reply:
+                    got_id, got_seq = struct.unpack(
+                        ">HH", data[offset + 4:offset + 8])
                     if got_id == ident and got_seq == self._seq:
                         return (time.perf_counter() - start) * 1000.0
         except Exception:
@@ -1003,26 +1209,45 @@ def parse_probe_spec(spec: str) -> Probe:
             raise ValueError("bad marking in probe spec: %r" % spec)
         dscp = dscp_value(value)
 
-    parts = text.split(":")
-    kind = parts[0].strip().lower()
+    kind, _, rest = text.partition(":")
+    kind = kind.strip().lower()
     if kind not in _PROBE_KINDS:
         raise ValueError("unknown probe kind %r in %r" % (kind, spec))
     cls, default_port = _PROBE_KINDS[kind]
 
-    host = parts[1].strip() if len(parts) > 1 else ""
+    rest = rest.strip()
+    port_text = ""
+    if rest.startswith("["):
+        close = rest.find("]")
+        if close < 0:
+            raise ValueError("unclosed bracket in probe spec: %r" % spec)
+        host = rest[1:close].strip()
+        tail = rest[close + 1:]
+        if tail.startswith(":"):
+            port_text = tail[1:].strip()
+        elif tail:
+            raise ValueError("junk after the address in probe spec: %r" % spec)
+    else:
+        bits = rest.split(":")
+        if len(bits) > 2:
+            raise ValueError(
+                "too many fields in probe spec: %r - an IPv6 literal must be "
+                "bracketed, as in tcp:[2606:4700:4700::1111]:853" % spec)
+        host = bits[0].strip()
+        if len(bits) > 1:
+            port_text = bits[1].strip()
+
     if not host:
         raise ValueError("missing host in probe spec: %r" % spec)
 
     port = default_port
-    if len(parts) > 2 and parts[2].strip():
+    if port_text:
         try:
-            port = int(parts[2])
+            port = int(port_text)
         except ValueError:
             raise ValueError("bad port in probe spec: %r" % spec)
         if not 1 <= port <= 65535:
             raise ValueError("port out of range in probe spec: %r" % spec)
-    if len(parts) > 3:
-        raise ValueError("too many fields in probe spec: %r" % spec)
 
     probe = (cls(host, dscp=dscp) if default_port is None
              else cls(host, port=port, dscp=dscp))
@@ -2400,7 +2625,12 @@ def _add_common(parser: "argparse.ArgumentParser") -> None:
     parser.add_argument("--probe", action="append", metavar="SPEC",
                         help="probe spec, repeatable, replaces the default set: "
                              "kind:host[:port][@dscp=NAME][#label] where kind is "
-                             "tcp, dns, stun or icmp")
+                             "tcp, dns, stun or icmp. Bracket an IPv6 literal: "
+                             "tcp:[2606:4700:4700::1111]:853")
+    parser.add_argument("--family", choices=("auto", "4", "6"), default="auto",
+                        help="address family for probes. auto follows the "
+                             "system order; 4 or 6 forces one and fails rather "
+                             "than falling back to the other")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2819,11 +3049,20 @@ def select_probes(args: "argparse.Namespace", env: Dict[str, Any]) -> List[Probe
     if not specs and getattr(args, "command", None) == "classes":
         specs = [spec for spec, _ in CLASS_PRESET]
     if specs:
-        return [parse_probe_spec(s) for s in specs]
-    targets = [t.strip() for t in args.targets.split(",") if t.strip()]
-    gateway = None if args.no_gateway else env.get("gateway")
-    use_icmp = (not args.no_icmp) and bool(env.get("icmp_available"))
-    return build_probes(targets, gateway, use_icmp)
+        probes = [parse_probe_spec(s) for s in specs]
+    else:
+        targets = [t.strip() for t in args.targets.split(",") if t.strip()]
+        # Probing the v4 gateway during a v6 run would attribute delay to a
+        # router leg the traffic never touched.
+        key = "gateway6" if getattr(args, "family", "auto") == "6" else "gateway"
+        gateway = None if args.no_gateway else env.get(key)
+        use_icmp = (not args.no_icmp) and bool(env.get("icmp_available"))
+        probes = build_probes(targets, gateway, use_icmp)
+    family = FAMILY_CHOICES.get(getattr(args, "family", "auto") or "auto",
+                                socket.AF_UNSPEC)
+    for probe in probes:
+        probe.family = family
+    return probes
 
 
 def _probe_setup(args: "argparse.Namespace", env: Dict[str, Any]
@@ -2857,6 +3096,21 @@ def render_classes(result: Dict[str, Any]) -> str:
             lines.append("  %-16s %s %s %s  %s" % (
                 name[:16], _fmt(base, 9), _fmt(loaded, 9), _fmt(added, 9),
                 expected.get(name, "-")))
+    marking = result.get("marking") or []
+    if marking:
+        lines.append("")
+        lines.append("%-18s %-8s %s" % ("marked probe", "dscp", "applied"))
+        for entry in marking:
+            applied = entry.get("applied")
+            if applied is True:
+                state = "yes"
+            elif applied is False:
+                state = "NOT applied - the OS refused the mark, so this row "
+                state += "cannot speak to QoS"
+            else:
+                state = "unknown"
+            lines.append("  %-16s %-8s %s" % (
+                str(entry.get("probe"))[:16], entry.get("name") or "-", state))
     return "\n".join(lines)
 
 
@@ -2890,6 +3144,7 @@ def _measure_once(args: "argparse.Namespace"):
         result = build_result(env, dict(EMPTY_SPEEDTEST), {}, runner.samples(),
                               {}, started_at, mode="probe",
                               keep_samples=getattr(args, "raw", False))
+        result["marking"] = marking_report(probes)
         result["observed_throughput"] = observed_throughput(nic.samples())
         result["router_throughput"] = router_throughput(
             router, keep_samples=getattr(args, "raw", False))
@@ -2975,6 +3230,7 @@ def _measure_once(args: "argparse.Namespace"):
     result = build_result(env, speed_result, buckets, idle,
                           throughput, started_at, mode=args.command,
                           keep_samples=getattr(args, "raw", False))
+    result["marking"] = marking_report(probes)
     # Stamp provenance: comparing arms across generators is invalid, and a run
     # with no record of how it was measured cannot be checked for that later.
     result["generator"] = generator
@@ -3143,6 +3399,7 @@ def cmd_monitor(args: "argparse.Namespace") -> int:
     result = build_result(env, dict(EMPTY_SPEEDTEST), {}, runner.samples(),
                           {}, started_at, mode="monitor",
                           keep_samples=getattr(args, "raw", False))
+    result["marking"] = marking_report(probes)
     result["observed_throughput"] = observed_throughput(nic.samples())
     result["router_throughput"] = router_throughput(
             router, keep_samples=getattr(args, "raw", False))

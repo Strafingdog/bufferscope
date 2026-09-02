@@ -2728,3 +2728,393 @@ class TestMonitorAlerting(CliMixin, unittest.TestCase):
                 with open(counter) as handle:
                     fired = handle.read()
             self.assertEqual(len(fired), 1)
+
+
+class _FakeSock:
+    """Records setsockopt calls and answers getsockopt from a chosen store."""
+
+    def __init__(self, honour=True, raise_on_set=False):
+        self.honour = honour
+        self.raise_on_set = raise_on_set
+        self.calls = []
+        self._store = {}
+
+    def setsockopt(self, level, option, value):
+        self.calls.append((level, option, value))
+        if self.raise_on_set:
+            raise OSError("refused")
+        if self.honour:
+            self._store[(level, option)] = value
+
+    def getsockopt(self, level, option):
+        return self._store.get((level, option), 0)
+
+
+class TestApplyDscp(unittest.TestCase):
+    def test_no_marking_requested_reports_nothing(self):
+        sock = _FakeSock()
+        self.assertIsNone(bufferscope.apply_dscp(sock, None))
+        self.assertEqual(sock.calls, [])
+
+    def test_mark_that_reads_back_is_applied(self):
+        sock = _FakeSock(honour=True)
+        self.assertIs(bufferscope.apply_dscp(sock, 46), True)
+
+    def test_mark_the_os_silently_drops_is_not_applied(self):
+        # Windows commonly ignores IP_TOS without a QoS policy. Silently
+        # continuing would produce a comparison that means nothing.
+        sock = _FakeSock(honour=False)
+        self.assertIs(bufferscope.apply_dscp(sock, 46), False)
+
+    def test_mark_the_os_refuses_outright_is_not_applied(self):
+        sock = _FakeSock(raise_on_set=True)
+        self.assertIs(bufferscope.apply_dscp(sock, 46), False)
+
+    def test_ipv4_uses_the_tos_byte(self):
+        sock = _FakeSock()
+        bufferscope.apply_dscp(sock, 46, family=socket.AF_INET)
+        self.assertEqual(sock.calls,
+                         [(socket.IPPROTO_IP, socket.IP_TOS, 184)])
+
+    def test_ipv6_uses_the_traffic_class(self):
+        sock = _FakeSock()
+        bufferscope.apply_dscp(sock, 46, family=socket.AF_INET6)
+        level, option, value = sock.calls[0]
+        self.assertEqual(level, socket.IPPROTO_IPV6)
+        self.assertEqual(option, bufferscope.IPV6_TCLASS)
+        self.assertEqual(value, 184)
+
+
+class TestDscpName(unittest.TestCase):
+    def test_known_values_render_as_names(self):
+        self.assertEqual(bufferscope.dscp_name(46), "ef")
+        self.assertEqual(bufferscope.dscp_name(34), "af41")
+
+    def test_unknown_value_renders_as_a_number(self):
+        self.assertEqual(bufferscope.dscp_name(61), "dscp61")
+
+
+class TestMarkingReport(unittest.TestCase):
+    def _probe(self, name, dscp, applied):
+        probe = FakeProbe(name, [1.0])
+        probe.dscp = dscp
+        probe.dscp_applied = applied
+        return probe
+
+    def test_unmarked_probes_are_absent(self):
+        report = bufferscope.marking_report([self._probe("plain", None, None)])
+        self.assertEqual(report, [])
+
+    def test_marked_probe_reports_what_it_asked_for(self):
+        report = bufferscope.marking_report([self._probe("voice", 46, True)])
+        self.assertEqual(report, [{"probe": "voice", "dscp": 46,
+                                   "name": "ef", "applied": True}])
+
+    def test_refused_marking_is_reported_as_such(self):
+        report = bufferscope.marking_report([self._probe("voice", 46, False)])
+        self.assertIs(report[0]["applied"], False)
+
+
+class TestRenderClassesMarking(unittest.TestCase):
+    def _result(self, marking):
+        return {
+            "phases": {
+                "idle": {"probes": {"voice": {"p95": 5.0}}},
+                "upload": {"probes": {"voice": {"p95": 9.0}}},
+            },
+            "marking": marking,
+        }
+
+    def test_refused_marking_is_called_out(self):
+        text = bufferscope.render_classes(
+            self._result([{"probe": "voice", "dscp": 46, "name": "ef",
+                           "applied": False}]))
+        self.assertIn("NOT applied", text)
+        text.encode("ascii")
+
+    def test_applied_marking_is_shown_without_alarm(self):
+        text = bufferscope.render_classes(
+            self._result([{"probe": "voice", "dscp": 46, "name": "ef",
+                           "applied": True}]))
+        self.assertIn("ef", text)
+        self.assertNotIn("NOT applied", text)
+
+
+class TestMarkingInResult(CliMixin, unittest.TestCase):
+    """A marked run must record whether the mark actually took."""
+
+    def setUp(self):
+        self._env = bufferscope.collect_env
+        bufferscope.collect_env = lambda: {"os": "test", "gateway": None,
+                                           "icmp_available": False}
+        self._find = bufferscope.find_speedtest
+        bufferscope.find_speedtest = lambda: None
+
+    def tearDown(self):
+        bufferscope.collect_env = self._env
+        bufferscope.find_speedtest = self._find
+
+    def test_probe_run_records_the_marking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "p.json")
+            with _tcp_listener() as port:
+                self._run(["probe", "--duration", "1", "--probe-interval", "50",
+                           "--no-gateway", "--out", path,
+                           "--probe", "tcp:127.0.0.1:%d@dscp=ef#voice" % port])
+            with open(path) as handle:
+                doc = json.load(handle)
+        self.assertEqual(len(doc["marking"]), 1)
+        entry = doc["marking"][0]
+        self.assertEqual(entry["probe"], "voice")
+        self.assertEqual(entry["name"], "ef")
+        self.assertIn(entry["applied"], (True, False))
+
+    def test_unmarked_run_records_an_empty_marking_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "p.json")
+            with _tcp_listener() as port:
+                self._run(["probe", "--duration", "1", "--probe-interval", "50",
+                           "--no-gateway", "--out", path,
+                           "--probe", "tcp:127.0.0.1:%d#plain" % port])
+            with open(path) as handle:
+                doc = json.load(handle)
+        self.assertEqual(doc["marking"], [])
+
+
+def _ipv6_ready():
+    if not socket.has_ipv6:
+        return False
+    try:
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        sock.bind(("::1", 0))
+        sock.close()
+        return True
+    except Exception:
+        return False
+
+
+IPV6 = _ipv6_ready()
+
+
+@contextlib.contextmanager
+def _tcp_listener6():
+    srv = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("::1", 0))
+    srv.listen(64)
+    srv.settimeout(0.2)
+    stop = threading.Event()
+
+    def serve():
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+                conn.close()
+            except Exception:
+                pass
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        yield srv.getsockname()[1]
+    finally:
+        stop.set()
+        thread.join(timeout=2)
+        srv.close()
+
+
+class TestHostLabel(unittest.TestCase):
+    def test_ipv4_is_bare(self):
+        self.assertEqual(bufferscope.host_label("1.1.1.1"), "1.1.1.1")
+
+    def test_ipv6_is_bracketed(self):
+        self.assertEqual(bufferscope.host_label("::1"), "[::1]")
+
+    def test_hostname_is_bare(self):
+        self.assertEqual(bufferscope.host_label("example.com"), "example.com")
+
+
+class TestProbeSpecIPv6(unittest.TestCase):
+    def test_bracketed_literal_with_port(self):
+        probe = bufferscope.parse_probe_spec("tcp:[2606:4700:4700::1111]:853")
+        self.assertEqual(probe.host, "2606:4700:4700::1111")
+        self.assertEqual(probe.port, 853)
+
+    def test_bracketed_literal_takes_the_default_port(self):
+        probe = bufferscope.parse_probe_spec("tcp:[::1]")
+        self.assertEqual(probe.host, "::1")
+        self.assertEqual(probe.port, 443)
+
+    def test_bracketed_literal_keeps_marking_and_label(self):
+        probe = bufferscope.parse_probe_spec(
+            "dns:[2606:4700:4700::1111]@dscp=ef#v6dns")
+        self.assertEqual(probe.host, "2606:4700:4700::1111")
+        self.assertEqual(probe.dscp, 46)
+        self.assertEqual(probe.name, "v6dns")
+
+    def test_unbracketed_literal_is_rejected_with_a_hint(self):
+        with self.assertRaises(ValueError) as caught:
+            bufferscope.parse_probe_spec("tcp:2606:4700:4700::1111:853")
+        self.assertIn("bracket", str(caught.exception).lower())
+
+    def test_ipv4_spec_is_unchanged(self):
+        probe = bufferscope.parse_probe_spec("tcp:1.1.1.1:853")
+        self.assertEqual((probe.host, probe.port), ("1.1.1.1", 853))
+
+    def test_generated_name_parses_back(self):
+        probe = bufferscope.TcpProbe("::1", port=853)
+        again = bufferscope.parse_probe_spec(probe.name)
+        self.assertEqual((again.host, again.port), ("::1", 853))
+
+
+class TestResolveEndpoint(unittest.TestCase):
+    def test_ipv4_literal_resolves_to_inet(self):
+        family, sockaddr = bufferscope.resolve_endpoint("127.0.0.1", 80)
+        self.assertEqual(family, socket.AF_INET)
+        self.assertEqual(sockaddr[0], "127.0.0.1")
+
+    @unittest.skipUnless(IPV6, "no usable IPv6 on this host")
+    def test_ipv6_literal_resolves_to_inet6(self):
+        family, sockaddr = bufferscope.resolve_endpoint("::1", 80)
+        self.assertEqual(family, socket.AF_INET6)
+        self.assertEqual(sockaddr[0], "::1")
+
+    def test_forcing_v6_on_a_v4_literal_fails(self):
+        with self.assertRaises(OSError):
+            bufferscope.resolve_endpoint("127.0.0.1", 80,
+                                         family=socket.AF_INET6)
+
+    def test_forcing_v4_on_a_v6_literal_fails(self):
+        with self.assertRaises(OSError):
+            bufferscope.resolve_endpoint("::1", 80, family=socket.AF_INET)
+
+
+class TestProbeOverIPv6(unittest.TestCase):
+    @unittest.skipUnless(IPV6, "no usable IPv6 on this host")
+    def test_tcp_probe_measures_over_ipv6(self):
+        with _tcp_listener6() as port:
+            probe = bufferscope.TcpProbe("::1", port=port)
+            value = probe.sample()
+        self.assertIsInstance(value, float)
+
+    @unittest.skipUnless(IPV6, "no usable IPv6 on this host")
+    def test_ipv6_probe_marks_with_traffic_class_not_tos(self):
+        with _tcp_listener6() as port:
+            probe = bufferscope.TcpProbe("::1", port=port, dscp=46)
+            probe.sample()
+        self.assertIsNotNone(probe.dscp_applied)
+
+    def test_name_of_an_ipv6_probe_is_bracketed(self):
+        self.assertEqual(bufferscope.TcpProbe("::1", port=443).name,
+                         "tcp:[::1]:443")
+        self.assertEqual(bufferscope.UdpDnsProbe("::1").name, "dns:[::1]")
+
+
+class TestFamilySelection(CliMixin, unittest.TestCase):
+    def test_family_flag_is_parsed(self):
+        args = bufferscope.build_parser().parse_args(["probe", "--family", "6"])
+        self.assertEqual(args.family, "6")
+
+    def test_default_family_is_auto(self):
+        args = bufferscope.build_parser().parse_args(["probe"])
+        self.assertEqual(args.family, "auto")
+
+    def test_family_reaches_the_probes(self):
+        args = bufferscope.build_parser().parse_args(
+            ["probe", "--family", "4", "--probe", "tcp:localhost:80"])
+        probes = bufferscope.select_probes(
+            args, {"gateway": None, "icmp_available": False})
+        self.assertEqual(probes[0].family, socket.AF_INET)
+
+
+WIN_ROUTE6_CSV = """"NextHop","RouteMetric","ifIndex"
+"::","256","1"
+"fe80::1","25","14"
+"fe80::dead:beef","50","14"
+"""
+
+# /proc/net/ipv6_route: dest prefixlen src srclen nexthop metric refcnt use
+# flags device. The default route is destination :: with prefix length 0.
+LINUX_ROUTE6 = """\
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 \
+fe800000000000000000000000000001 00000400 00000000 00000000 00000003 eth0
+fe800000000000000000000000000000 40 00000000000000000000000000000000 00 \
+00000000000000000000000000000000 00000100 00000000 00000001 00000001 eth0
+"""
+
+MACOS_ROUTE6 = """Internet6:
+Destination        Gateway            Flags     Netif Expire
+default            fe80::1%en0        UGcg        en0
+::1                ::1                UHL         lo0
+"""
+
+
+class TestGateway6Parsers(unittest.TestCase):
+    def test_windows_prefers_lowest_metric(self):
+        # A link-local gateway is unreachable without its scope, so the
+        # interface index has to travel with the address.
+        self.assertEqual(bufferscope.parse_gateway6_windows(WIN_ROUTE6_CSV),
+                         "fe80::1%14")
+
+    def test_windows_global_nexthop_carries_no_scope(self):
+        csv = (chr(34) + "NextHop" + chr(34) + "," + chr(34) + "RouteMetric"
+               + chr(34) + "," + chr(34) + "ifIndex" + chr(34) + chr(10)
+               + chr(34) + "2001:db8::1" + chr(34) + "," + chr(34) + "5"
+               + chr(34) + "," + chr(34) + "14" + chr(34))
+        self.assertEqual(bufferscope.parse_gateway6_windows(csv),
+                         "2001:db8::1")
+
+    def test_windows_skips_the_unspecified_next_hop(self):
+        self.assertIsNone(bufferscope.parse_gateway6_windows(
+            chr(34) + "NextHop" + chr(34) + "," + chr(34) + "RouteMetric"
+            + chr(34) + chr(10) + chr(34) + "::" + chr(34) + ","
+            + chr(34) + "1" + chr(34)))
+
+    def test_linux_decodes_the_default_route(self):
+        self.assertEqual(bufferscope.parse_gateway6_linux(LINUX_ROUTE6),
+                         "fe80::1%eth0")
+
+    def test_macos_reads_the_default_row(self):
+        self.assertEqual(bufferscope.parse_gateway6_macos(MACOS_ROUTE6),
+                         "fe80::1%en0")
+
+    def test_all_return_none_on_garbage(self):
+        for fn in (bufferscope.parse_gateway6_windows,
+                   bufferscope.parse_gateway6_linux,
+                   bufferscope.parse_gateway6_macos):
+            self.assertIsNone(fn(""))
+            self.assertIsNone(fn("not remotely valid output"))
+
+
+class TestGateway6InEnvAndProbes(unittest.TestCase):
+    def test_env_carries_both_gateways(self):
+        real4, real6 = bufferscope.detect_gateway, bufferscope.detect_gateway6
+        bufferscope.detect_gateway = lambda: "192.168.1.1"
+        bufferscope.detect_gateway6 = lambda: "fe80::1%14"
+        try:
+            env = bufferscope.collect_env()
+        finally:
+            bufferscope.detect_gateway = real4
+            bufferscope.detect_gateway6 = real6
+        self.assertEqual(env["gateway"], "192.168.1.1")
+        self.assertEqual(env["gateway6"], "fe80::1%14")
+
+    def test_family_6_probes_the_v6_gateway(self):
+        args = bufferscope.build_parser().parse_args(
+            ["probe", "--family", "6", "--targets", "2606:4700:4700::1111"])
+        probes = bufferscope.select_probes(
+            args, {"gateway": "192.168.1.1", "gateway6": "fe80::1",
+                   "icmp_available": False})
+        names = " ".join(p.name for p in probes)
+        self.assertIn("[fe80::1]", names)
+        self.assertNotIn("192.168.1.1", names)
+
+    def test_family_4_still_probes_the_v4_gateway(self):
+        args = bufferscope.build_parser().parse_args(
+            ["probe", "--family", "4", "--targets", "1.1.1.1"])
+        probes = bufferscope.select_probes(
+            args, {"gateway": "192.168.1.1", "gateway6": "fe80::1",
+                   "icmp_available": False})
+        names = " ".join(p.name for p in probes)
+        self.assertIn("192.168.1.1", names)
+        self.assertNotIn("fe80::1", names)
