@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Segment a passive netdiag run by the router's throughput, then report
+"""Segment a passive bufferscope run by the router's throughput, then report
 latency per load period.
 
-netdiag normally learns its phase boundaries from Ookla's event stream. With
+bufferscope normally learns its phase boundaries from Ookla's event stream. With
 any other load generator there is no such stream, so this derives the periods
 from what the WAN actually carried - which is a better referee anyway, since
 it depends on neither tool's claims.
@@ -14,7 +14,7 @@ import argparse
 import json
 import sys
 
-import netdiag
+import bufferscope
 
 # A period counts as "loaded" above this share of the run's peak throughput.
 DEFAULT_SHARE = 0.35
@@ -62,13 +62,13 @@ def periods(points, index, threshold):
 def stats_in(series, spans):
     picked = [(t, v) for t, v in series
               if any(a <= t <= b for a, b in spans)]
-    return netdiag.summarize(picked)
+    return bufferscope.summarize(picked)
 
 
 def outside(series, all_spans):
     picked = [(t, v) for t, v in series
               if not any(a <= t <= b for a, b in all_spans)]
-    return netdiag.summarize(picked)
+    return bufferscope.summarize(picked)
 
 
 def main(argv=None):

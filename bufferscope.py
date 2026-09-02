@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""netdiag - measure latency under load (bufferbloat) and tune router QoS.
+"""bufferscope - measure latency under load (bufferbloat) and tune router QoS.
 
 Single file, standard library only, Python 3.9+.
 """
@@ -626,7 +626,7 @@ def collect_env() -> Dict[str, Any]:
     return {
         "os": "%s %s" % (platform.system(), platform.release()),
         "python": sys.version.split()[0],
-        "netdiag_version": VERSION,
+        "bufferscope_version": VERSION,
         "schema_version": SCHEMA_VERSION,
         "gateway": detect_gateway(),
         "interfaces": {k: {"rx_bytes": v[0], "tx_bytes": v[1]}
@@ -839,7 +839,7 @@ class IcmpProbe(Probe):
         self._seq = (self._seq + 1) & 0xFFFF
         ident = os.getpid() & 0xFFFF
         header = struct.pack(">BBHHH", 8, 0, 0, ident, self._seq)
-        payload = b"netdiag-" + bytes(24)
+        payload = b"bufferscope-" + bytes(24)
         checksum = self._checksum(header + payload)
         packet = struct.pack(">BBHHH", 8, 0, checksum, ident, self._seq) + payload
         try:
@@ -1096,7 +1096,7 @@ def find_librespeed() -> Optional[str]:
 
 
 def parse_librespeed_json(text: str) -> Dict[str, Any]:
-    """Parse `librespeed-cli --json` into netdiag's canonical speedtest shape.
+    """Parse `librespeed-cli --json` into bufferscope's canonical speedtest shape.
 
     Two differences from Ookla worth knowing: librespeed reports Mbps directly
     rather than bytes/sec, and it has no packet-loss metric at all.
@@ -1892,7 +1892,7 @@ def resolve_device_community(device: SnmpDevice,
         value = os.environ.get(device.community_env)
         if value:
             return value
-    return os.environ.get("NETDIAG_SNMP_COMMUNITY") or "public"
+    return os.environ.get("BUFFERSCOPE_SNMP_COMMUNITY") or "public"
 
 
 def build_snmp_devices(args: "argparse.Namespace") -> List[SnmpDevice]:
@@ -2006,7 +2006,7 @@ def build_result(env: Dict[str, Any],
 
     result = {
         "schema_version": SCHEMA_VERSION,
-        "netdiag_version": VERSION,
+        "bufferscope_version": VERSION,
         "started_at": started_at,
         "mode": mode,
         "env": env,
@@ -2024,11 +2024,16 @@ def _fmt(value: Optional[float], width: int = 8, places: int = 2) -> str:
     return "%*.*f" % (width, places, value)
 
 
+def _tool_version(doc: Dict[str, Any]) -> Optional[str]:
+    """Runs recorded before the tool was renamed carry the old key."""
+    return doc.get("bufferscope_version") or doc.get("netdiag_version")
+
+
 def render_human(result: Dict[str, Any]) -> str:
     lines: List[str] = []
     speed = result.get("speedtest") or {}
-    lines.append("netdiag %s   %s" % (result.get("netdiag_version"),
-                                      result.get("started_at")))
+    lines.append("bufferscope %s   %s" % (_tool_version(result),
+                                          result.get("started_at")))
     server = speed.get("server") or {}
     if server:
         lines.append("server: %s, %s (id %s)" % (
@@ -2076,8 +2081,8 @@ def _ci(stats: Dict[str, Any]) -> str:
 def render_aggregate(doc: Dict[str, Any]) -> str:
     """Report repeated runs with error bars rather than a single number."""
     agg = doc.get("aggregate") or {}
-    lines = ["netdiag %s   %s   repeats: %d (excluded %d)" % (
-        doc.get("netdiag_version"), doc.get("started_at"),
+    lines = ["bufferscope %s   %s   repeats: %d (excluded %d)" % (
+        _tool_version(doc), doc.get("started_at"),
         agg.get("included_runs", 0), agg.get("excluded_runs", 0))]
     for reason in (agg.get("exclusions") or []):
         lines.append("    excluded %s" % reason)
@@ -2230,7 +2235,7 @@ def _add_common(parser: "argparse.ArgumentParser") -> None:
                         help="poll this router over SNMP for whole-household "
                              "traffic, not just this PC")
     parser.add_argument("--snmp-community", metavar="STR",
-                        help="SNMP community (default: $NETDIAG_SNMP_COMMUNITY, "
+                        help="SNMP community (default: $BUFFERSCOPE_SNMP_COMMUNITY, "
                              "else 'public')")
     parser.add_argument("--snmp-port", type=int, default=161)
     parser.add_argument("--snmp-interface", metavar="NAME",
@@ -2249,7 +2254,7 @@ def _add_common(parser: "argparse.ArgumentParser") -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="netdiag",
+        prog="bufferscope",
         description="Measure latency under load (bufferbloat) and tune router QoS.")
     parser.add_argument("--version", action="store_true",
                         help="print tool and schema version")
@@ -2310,7 +2315,7 @@ def _emit(result: Dict[str, Any], args: "argparse.Namespace", text: str) -> None
 def snmp_community(args: "argparse.Namespace") -> str:
     """Flag beats environment beats the SNMP default. Never logged."""
     return (getattr(args, "snmp_community", None)
-            or os.environ.get("NETDIAG_SNMP_COMMUNITY")
+            or os.environ.get("BUFFERSCOPE_SNMP_COMMUNITY")
             or "public")
 
 
@@ -2426,7 +2431,7 @@ def cmd_router(args: "argparse.Namespace") -> int:
         print("error: no SNMP reply from %s.\n"
               "  - is the SNMP agent enabled on the router?\n"
               "  - is the community string correct? (set "
-              "NETDIAG_SNMP_COMMUNITY, or pass --snmp-community)\n"
+              "BUFFERSCOPE_SNMP_COMMUNITY, or pass --snmp-community)\n"
               "  - does the router restrict SNMP to specific manager IPs?"
               % host, file=sys.stderr)
         return EXIT_ERROR
@@ -2797,7 +2802,7 @@ def _aggregate_doc(runs: List[Dict[str, Any]], repeat: int, started_at: str,
     agg = aggregate_runs(runs)
     doc = {
         "schema_version": SCHEMA_VERSION,
-        "netdiag_version": VERSION,
+        "bufferscope_version": VERSION,
         "started_at": started_at,
         "env": runs[0].get("env") if runs else {},
         "repeat": {"n": repeat, "completed": len(runs),
@@ -2917,7 +2922,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if getattr(args, "version", False):
-        print("netdiag %s (schema %d)" % (VERSION, SCHEMA_VERSION))
+        print("bufferscope %s (schema %d)" % (VERSION, SCHEMA_VERSION))
         return EXIT_OK
     if args.command == "router":
         return cmd_router(args)

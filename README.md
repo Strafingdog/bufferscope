@@ -1,4 +1,4 @@
-# netdiag
+# bufferscope
 
 Measure what your speed test won't: **latency under load**.
 
@@ -8,7 +8,7 @@ queue behind bulk traffic and latency collapses. On the router that motivated
 this tool, saturating the upstream drove p95 latency from 4.9 ms to 245 ms while
 every conventional speed test still reported a perfect 900/900 connection.
 
-netdiag saturates the link with the Ookla CLI, probes latency at 50 Hz on
+bufferscope saturates the link with the Ookla CLI, probes latency at 50 Hz on
 background threads, and correlates every sample to the exact test phase it
 occurred in. It reports percentiles rather than means, tells you whether the
 delay originates at your router or beyond it, and refuses to publish a result
@@ -59,16 +59,16 @@ brew install speedtest-cli             # macOS
 apt install speedtest-cli              # Debian/Ubuntu
 ```
 
-netdiag finds the binary automatically on PATH or in the usual install
+bufferscope finds the binary automatically on PATH or in the usual install
 locations. Nothing is hardcoded.
 
 ## Install
 
-Download `netdiag.py`. That is the whole tool.
+Download `bufferscope.py`. That is the whole tool.
 
 ```bash
-chmod +x netdiag.py        # optional, POSIX
-python netdiag.py --version
+chmod +x bufferscope.py        # optional, POSIX
+python bufferscope.py --version
 ```
 
 ## Usage
@@ -76,11 +76,11 @@ python netdiag.py --version
 ### `bufferbloat` - the main command
 
 ```
-$ python netdiag.py bufferbloat
+$ python bufferscope.py bufferbloat
 ```
 
 ```
-netdiag 1.0.0   2026-08-21T13:33:07
+bufferscope 1.0.0   2026-08-21T13:33:07
 server: Example Networks, Anytown (id 12345)
 
 Download: 947.8 Mbps    Upload: 836.7 Mbps    Idle latency: 4.21 ms
@@ -106,7 +106,7 @@ Bufferbloat: worst added p95 22.12 ms  ->  grade A
 ### `probe` - latency only, generates no load
 
 ```
-$ python netdiag.py probe --duration 60 --targets 1.1.1.1,8.8.8.8
+$ python bufferscope.py probe --duration 60 --targets 1.1.1.1,8.8.8.8
 ```
 
 Useful for characterising a link at rest, or for measuring from a second
@@ -115,16 +115,16 @@ machine while a first machine generates load.
 ### `monitor` - long-running, catches intermittent faults
 
 ```
-$ python netdiag.py monitor --duration 3600 --interval 60
+$ python bufferscope.py monitor --duration 3600 --interval 60
 ```
 
 One summary line per probe per interval, then a final aggregate. Ctrl-C exits
 cleanly and still writes a complete result.
 
-### `env` - what netdiag detected about this machine
+### `env` - what bufferscope detected about this machine
 
 ```
-$ python netdiag.py env
+$ python bufferscope.py env
 ```
 
 Paste this into a bug report or an LLM session before anything else.
@@ -132,10 +132,10 @@ Paste this into a bug report or an LLM session before anything else.
 ### `compare` - diff two runs
 
 ```
-$ python netdiag.py bufferbloat --out before.json
+$ python bufferscope.py bufferbloat --out before.json
    ... change one router setting ...
-$ python netdiag.py bufferbloat --out after.json
-$ python netdiag.py compare before.json after.json
+$ python bufferscope.py bufferbloat --out after.json
+$ python bufferscope.py compare before.json after.json
 ```
 
 ```
@@ -169,7 +169,7 @@ change you want - so you weigh the trade rather than being handed a verdict.
 --interval N            monitor summary interval (default 60)
 --repeat N              run N times, report mean/stdev/95% CI
 --router-snmp HOST      poll the router for whole-household traffic
---snmp-community STR    overrides $NETDIAG_SNMP_COMMUNITY
+--snmp-community STR    overrides $BUFFERSCOPE_SNMP_COMMUNITY
 --snmp-interface NAME   router interface to measure (default: busiest)
 --snmp-port N           default 161
 --snmp-device SPEC      extra SNMP target, repeatable (see below)
@@ -185,11 +185,11 @@ runs. Any single-run comparison of two router settings is therefore almost
 worthless: the difference you see is usually noise.
 
 ```
-$ netdiag.py classes --repeat 8 --server-id 12345 --out arm-a.json
+$ bufferscope.py classes --repeat 8 --server-id 12345 --out arm-a.json
 ```
 
 ```
-netdiag 1.0.0   2026-08-21T15:19:26   repeats: 8 (excluded 0)
+bufferscope 1.0.0   2026-08-21T15:19:26   repeats: 8 (excluded 0)
   download_mbps  mean    948.5 Mbps  95% CI [ 939.4, 957.6]  n=8
   upload_mbps    mean    867.7 Mbps  95% CI [ 866.7, 868.6]  n=8
 
@@ -235,12 +235,12 @@ again after only 25-30 runs inside the following hour.
 Practical planning: **three arms of eight, then expect to wait.** Decide which
 comparisons matter before you start, because you will not get to run them all
 back to back.
-netdiag surfaces the error and aborts after two consecutive failed runs rather
+bufferscope surfaces the error and aborts after two consecutive failed runs rather
 than grinding through the rest of the repeat.
 
 ### Seeing the whole household, not just this PC
 
-netdiag samples the NIC of the machine it runs on. Traffic from a TV, a phone or
+bufferscope samples the NIC of the machine it runs on. Traffic from a TV, a phone or
 any other device never crosses that adapter, so a host-based measurement is
 blind to most of what your connection is actually doing. The router is the only
 device that sees every client.
@@ -248,8 +248,8 @@ device that sees every client.
 `--router-snmp` polls the router's own interface counters over SNMPv2c:
 
 ```
-$ netdiag.py router                      # find the WAN interface
-$ netdiag.py probe --duration 300 --router-snmp 192.168.1.1
+$ bufferscope.py router                      # find the WAN interface
+$ bufferscope.py probe --duration 300 --router-snmp 192.168.1.1
 ```
 
 ```
@@ -266,12 +266,12 @@ other devices               1.110      0.179
    counters on a trusted LAN.
 2. Change the **Get community** from `public` to something unguessable.
 3. Change the **Set community** from `private` too. It grants *write* access to
-   your router's configuration and netdiag never uses it.
+   your router's configuration and bufferscope never uses it.
 4. Make sure SNMP is **not** exposed to the internet. On most routers this is
    a separate switch on the management or remote-access page.
 
 ```bash
-export NETDIAG_SNMP_COMMUNITY="your-read-community"     # or setx on Windows
+export BUFFERSCOPE_SNMP_COMMUNITY="your-read-community"     # or setx on Windows
 ```
 
 The community is read from the environment, never written to a result file and
@@ -285,7 +285,7 @@ internet link, but nothing about which access point is carrying which client.
 `HOST[,env=VAR][,label=NAME][,iface=NAME][,port=N]`:
 
 ```
-$ netdiag.py probe --duration 300 \
+$ bufferscope.py probe --duration 300 \
     --snmp-device 192.0.2.1,label=gateway \
     --snmp-device 192.0.2.2,env=AP_UPSTAIRS_COMMUNITY,label=upstairs \
     --snmp-device 192.0.2.3,env=AP_GARAGE_COMMUNITY,label=garage,iface=LAN
@@ -299,7 +299,7 @@ is not a secret, so it is safe to write in a script, a Makefile, or a README.
 Each device resolves its community in this order:
 
 ```
---snmp-community  ->  device's env=VAR  ->  $NETDIAG_SNMP_COMMUNITY  ->  "public"
+--snmp-community  ->  device's env=VAR  ->  $BUFFERSCOPE_SNMP_COMMUNITY  ->  "public"
 ```
 
 Give each device its own community where the hardware allows it. Sharing one
@@ -327,7 +327,7 @@ points often refresh their counters far more slowly than a router does.
 
 **Counter granularity - read this before trusting a short window.** Routers
 refresh SNMP counters on their own schedule, and the rate varies widely by
-vendor. netdiag measures it rather than assuming, and `netdiag.py router`
+vendor. bufferscope measures it rather than assuming, and `bufferscope.py router`
 reports what it found:
 
 ```
@@ -347,7 +347,7 @@ t=6.09    +155,341,585 bytes
 ```
 
 An Ookla phase lasts about 7 seconds and therefore contains only ~3 refreshes.
-Integrating across it undercounted upload by 18%. netdiag handles this by
+Integrating across it undercounted upload by 18%. bufferscope handles this by
 measuring between observed counter *transitions* rather than sample boundaries,
 and by **refusing to report a figure** when a window is too short for the
 measured refresh rate - those phases record `router_note` instead, and
@@ -363,12 +363,12 @@ are where it earns its place.
 
 ## The QoS tuning workflow
 
-1. `netdiag.py bufferbloat --repeat 8 --server-id ID --out baseline.json`
+1. `bufferscope.py bufferbloat --repeat 8 --server-id ID --out baseline.json`
 2. Change **one** router setting. Typically: enable QoS on the WAN interface and
    set egress bandwidth slightly *below* your measured line rate, so the router
    becomes the bottleneck and owns the queue.
-3. `netdiag.py bufferbloat --repeat 8 --server-id ID --out attempt.json`
-4. `netdiag.py compare baseline.json attempt.json` - keep it only if the change
+3. `bufferscope.py bufferbloat --repeat 8 --server-id ID --out attempt.json`
+4. `bufferscope.py compare baseline.json attempt.json` - keep it only if the change
    is reported SIGNIFICANT.
 5. Repeat, moving the shaper up until latency degrades, then step back.
 
@@ -385,7 +385,7 @@ number and a wrong conclusion; see the section above.
 **control** on a port no rule matches:
 
 ```
-$ netdiag.py classes --repeat 8 --server-id ID \
+$ bufferscope.py classes --repeat 8 --server-id ID \
     --probe tcp:1.1.1.1:853#tcp-control \
     --probe stun:stun.l.google.com:19302#udp-control \
     --probe dns:1.1.1.1#dns-rule \
@@ -435,23 +435,23 @@ added p95 upload         +26.5 ms           +3.6 ms
 Not a contradiction, and not a fault in either tool - they stress different
 things. Ookla's upload test is far more aggressive (more parallel streams,
 harder ramp) while Waveform's download test is the harsher of its two. A
-passive `netdiag probe` run *during* a Waveform test reproduced Waveform's
+passive `bufferscope probe` run *during* a Waveform test reproduced Waveform's
 figures, confirming the measurement is sound and the difference is the load.
 
 Two consequences:
 
 - **Comparisons are valid only within one generator.** Every A/B in this
   README used Ookla throughout, so those results stand. Never compare a
-  netdiag figure against a Waveform or fast.com figure.
+  bufferscope figure against a Waveform or fast.com figure.
 - **Absolute numbers need their generator attached.** "This line adds 26 ms
   under upload saturation" means *under Ookla's upload saturation*. Under
   ordinary household use the same connection measured 6.9 ms p95.
 
 If you want to know how your link behaves for real traffic, measure real
-traffic: `netdiag probe` generates no load and observes what is actually
+traffic: `bufferscope probe` generates no load and observes what is actually
 happening.
 
-**Attribution.** netdiag probes your gateway *and* an internet target:
+**Attribution.** bufferscope probes your gateway *and* an internet target:
 
 - Both rise together -> the delay is at or before your router. Your ISP is fine;
   look at the router.
@@ -479,7 +479,7 @@ Exit codes:
 | 1 | Error - missing dependency, no targets, speedtest failure |
 | 2 | Completed, but the result is **not** trustworthy |
 
-Exit 2 means the measurement completed but netdiag does not stand behind it. The
+Exit 2 means the measurement completed but bufferscope does not stand behind it. The
 reasons are printed and included in the JSON. Rules that trigger it:
 
 - **Saturation** - NIC byte counters must show at least 75% of the throughput
@@ -508,10 +508,10 @@ throughput timeline instead of the load generator's own phase claims.
 ```
 {
   "schema_version": 1,
-  "netdiag_version": "1.0.0",
+  "bufferscope_version": "1.0.0",
   "started_at": "2026-08-21T13:33:07",
   "env": {
-    "os", "python", "netdiag_version", "schema_version",
+    "os", "python", "bufferscope_version", "schema_version",
     "gateway",            // detected default gateway, or null
     "interfaces",         // name -> {rx_bytes, tx_bytes}
     "speedtest_path", "speedtest_version",
@@ -567,10 +567,10 @@ Probe names encode transport and target: `tcp:1.1.1.1:443`, `dns:1.1.1.1`,
   stack. To rule that out, run `probe` on a second device while this one
   generates load. Throughput can now be measured household-wide via
   `--router-snmp`, but latency cannot.
-- **Router counters are coarse.** See the granularity note above. netdiag
+- **Router counters are coarse.** See the granularity note above. bufferscope
   declines to report rather than reporting a biased figure.
 - **ICMP needs privileges.** Raw sockets require root on Linux/macOS and admin on
-  Windows. Without them netdiag silently uses TCP and UDP probes, which are
+  Windows. Without them bufferscope silently uses TCP and UDP probes, which are
   unprivileged and sub-millisecond. Detail degrades; correctness does not.
 - **Ookla is required.** Self-generated HTTP load was tried and abandoned:
   providers rate-limit concurrent connections per source IP well below a gigabit,
@@ -581,8 +581,8 @@ Probe names encode transport and target: `tcp:1.1.1.1:443`, `dns:1.1.1.1`,
 ## Testing
 
 ```bash
-python -m unittest test_netdiag -v          # 82 tests, offline
-NETDIAG_E2E=1 python -m unittest test_netdiag.TestEndToEnd -v
+python -m unittest test_bufferscope -v          # 82 tests, offline
+BUFFERSCOPE_E2E=1 python -m unittest test_bufferscope.TestEndToEnd -v
 ```
 
 The default suite requires no network, no root and no particular OS - platform
