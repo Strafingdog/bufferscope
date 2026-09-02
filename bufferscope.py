@@ -7,6 +7,7 @@ import argparse
 import csv
 import datetime
 import glob
+import hmac
 import io
 import json
 import math
@@ -911,6 +912,7 @@ class Probe:
     """Base probe. Subclasses set `name` and implement `sample`."""
 
     name = "probe"
+    spec = "probe"
     dscp: Optional[int] = None
     dscp_applied: Optional[bool] = None
     family: int = socket.AF_UNSPEC
@@ -1253,6 +1255,9 @@ def parse_probe_spec(spec: str) -> Probe:
              else cls(host, port=port, dscp=dscp))
     if label:
         probe.name = label
+    # A labelled probe's name is the label, which cannot be parsed back, and
+    # peers have to be told what to measure.
+    probe.spec = text.strip() + (("#" + label) if label else "")
     return probe
 
 
@@ -1269,6 +1274,9 @@ def build_probes(targets: List[str], gateway: Optional[str],
         probes.append(TcpProbe(target, 443))
         if use_icmp:
             probes.append(IcmpProbe(target))
+    for probe in probes:
+        # These carry no label, so the generated name is already a valid spec.
+        probe.spec = probe.name
     return probes
 
 
@@ -2235,6 +2243,498 @@ class SnmpDeviceGroup:
 
 
 # --------------------------------------------------------------------------
+# AGENT
+# --------------------------------------------------------------------------
+
+AGENT_MAX_DURATION = 3600
+AGENT_DEFAULT_PORT = 7419
+AGENT_IO_TIMEOUT = 15.0
+# A load run has no duration up front, so peers are given a generous window
+# and stopped early by the collect that ends the measurement.
+PEER_LOAD_WINDOW = 300
+AGENT_MAX_REQUEST = 1 << 20
+NEWLINE = b"\n"
+
+
+def can_observe_dscp() -> bool:
+    """Whether this host can report the DSCP of a packet it received.
+
+    The mark arrives as ancillary data on recvmsg, which Windows does not
+    implement. Where it is missing the agent says so rather than reporting an
+    unmarked packet as though the mark had been stripped in transit.
+    """
+    return hasattr(socket.socket, "recvmsg")
+
+
+class AgentState:
+    """One measurement at a time, driven by a controller over TCP.
+
+    Deliberately small. It starts the probes it was asked for, reports what
+    they saw, and stops. It runs no commands, reads no files and writes none,
+    so the whole attack surface is the probe specs - which are parsed by the
+    same parser the CLI uses and can only name a host, a port and a marking.
+    """
+
+    def __init__(self, token: str, max_duration: int = AGENT_MAX_DURATION):
+        if not token:
+            raise ValueError("an agent needs a token")
+        self.token = str(token)
+        self.max_duration = int(max_duration)
+        self.runner: Optional[ProbeRunner] = None
+        self.started_at: Optional[str] = None
+        self.deadline: float = 0.0
+        self.observer: Optional["DscpObserver"] = None
+        # Where an observation socket should live. The server overrides this
+        # with whatever it bound, so an observer is never wider than the agent.
+        self.bind_host = "127.0.0.1"
+
+    def authorised(self, token: Any) -> bool:
+        return hmac.compare_digest(str(token or ""), self.token)
+
+    def stop(self) -> None:
+        runner, self.runner = self.runner, None
+        if runner is not None:
+            try:
+                runner.stop()
+            except Exception:
+                pass
+        observer, self.observer = self.observer, None
+        if observer is not None:
+            try:
+                observer.stop()
+            except Exception:
+                pass
+
+
+def _agent_start(state: AgentState, request: Dict[str, Any]) -> Dict[str, Any]:
+    if state.runner is not None:
+        return {"ok": False, "error": "a measurement is already running"}
+    specs = request.get("probes") or []
+    if not specs:
+        return {"ok": False, "error": "no probes requested"}
+    try:
+        duration = float(request.get("duration") or 0)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "bad duration"}
+    if duration <= 0 or duration > state.max_duration:
+        return {"ok": False,
+                "error": "duration must be between 1 and %d seconds"
+                         % state.max_duration}
+    try:
+        probes = [parse_probe_spec(spec) for spec in specs]
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    interval = 20
+    try:
+        interval = int(request.get("probe_interval") or 20)
+    except (TypeError, ValueError):
+        pass
+    interval = max(5, min(1000, interval))
+
+    runner = ProbeRunner(probes, interval)
+    runner.start()
+    state.runner = runner
+    state.started_at = datetime.datetime.now().isoformat(timespec="seconds")
+    state.deadline = time.perf_counter() + duration
+    return {"ok": True, "started_at": state.started_at,
+            "probes": [p.name for p in probes]}
+
+
+def _agent_collect(state: AgentState) -> Dict[str, Any]:
+    runner = state.runner
+    if runner is None:
+        return {"ok": False, "error": "not running"}
+    samples = runner.samples()
+    state.stop()
+    return {
+        "ok": True,
+        "started_at": state.started_at,
+        "os": "%s %s" % (platform.system(), platform.release()),
+        "probes": {name: summarize(series)
+                   for name, series in samples.items()},
+    }
+
+
+def handle_request(state: AgentState,
+                   request: Dict[str, Any]) -> Dict[str, Any]:
+    """Answer one controller request. Never raises."""
+    if not isinstance(request, dict):
+        return {"ok": False, "error": "malformed request"}
+    if not state.authorised(request.get("token")):
+        return {"ok": False, "error": "unauthorised"}
+    op = request.get("op")
+    if op == "hello":
+        return {"ok": True, "bufferscope_version": VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "capabilities": {"observe_dscp": can_observe_dscp()}}
+    if op == "start":
+        return _agent_start(state, request)
+    if op == "collect":
+        return _agent_collect(state)
+    if op == "observe_start":
+        return _agent_observe_start(state, request)
+    if op == "observe_report":
+        return _agent_observe_report(state)
+    if op == "stop":
+        state.stop()
+        return {"ok": True}
+    return {"ok": False, "error": "unknown op: %r" % (op,)}
+
+
+# Enabling the option and reading the resulting control message use different
+# numbers: IP_RECVTOS turns it on, the message itself arrives as IP_TOS.
+IP_RECVTOS_OPT = getattr(socket, "IP_RECVTOS", 13)
+IP_RECVTOS_CMSG = getattr(socket, "IP_TOS", 1)
+IPV6_RECVTCLASS_OPT = getattr(socket, "IPV6_RECVTCLASS", 66)
+OBSERVE_MAGIC = b"bufferscope-observe"
+
+
+def dscp_from_ancillary(ancdata: Any) -> Optional[int]:
+    """The DSCP of a received datagram, from recvmsg ancillary data."""
+    for level, kind, data in (ancdata or []):
+        marked = (level == socket.IPPROTO_IP and kind == IP_RECVTOS_CMSG) or \
+                 (level == socket.IPPROTO_IPV6 and kind == IPV6_TCLASS)
+        if not marked or not data:
+            continue
+        value = data[0] if len(data) == 1 else int.from_bytes(data[:4], "little")
+        return (value & 0xFF) >> 2
+    return None
+
+
+class DscpObserver:
+    """Counts datagrams and reports the marking each one still carried.
+
+    A socket read-back only proves the local OS accepted a mark. This is the
+    other half: what a packet looked like once it had crossed the network.
+    """
+
+    def __init__(self, host: str = "127.0.0.1", duration: float = 30.0):
+        self.can_read_marks = can_observe_dscp()
+        family, sockaddr = resolve_endpoint(host, 0, socket.AF_UNSPEC,
+                                            socket.SOCK_DGRAM)
+        self.sock = socket.socket(family, socket.SOCK_DGRAM)
+        self.sock.bind(sockaddr)
+        self.sock.settimeout(0.2)
+        if self.can_read_marks:
+            option = (IPV6_RECVTCLASS_OPT if family == socket.AF_INET6
+                      else IP_RECVTOS_OPT)
+            level = (socket.IPPROTO_IPV6 if family == socket.AF_INET6
+                     else socket.IPPROTO_IP)
+            try:
+                self.sock.setsockopt(level, option, 1)
+            except Exception:
+                self.can_read_marks = False
+        self.port = self.sock.getsockname()[1]
+        self.packets = 0
+        self.observed: List[int] = []
+        self.deadline = time.perf_counter() + duration
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while not self._stop.is_set() and time.perf_counter() < self.deadline:
+            try:
+                if self.can_read_marks:
+                    data, ancdata, _flags, _addr = self.sock.recvmsg(
+                        2048, socket.CMSG_SPACE(64))
+                    dscp = dscp_from_ancillary(ancdata)
+                else:
+                    data, _addr = self.sock.recvfrom(2048)
+                    dscp = None
+            except Exception:
+                continue
+            if not data.startswith(OBSERVE_MAGIC):
+                continue
+            self.packets += 1
+            if dscp is not None:
+                self.observed.append(dscp)
+
+    def report(self) -> Dict[str, Any]:
+        if not self.can_read_marks:
+            return {"packets": self.packets, "observed_dscp": None,
+                    "note": "this OS cannot report the marking of a received "
+                            "packet, so the mark could not be checked on the "
+                            "wire"}
+        return {"packets": self.packets,
+                "observed_dscp": sorted(set(self.observed)), "note": None}
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+        self._thread.join(timeout=2)
+
+
+def _agent_observe_start(state: "AgentState",
+                         request: Dict[str, Any]) -> Dict[str, Any]:
+    if state.observer is not None:
+        state.observer.stop()
+        state.observer = None
+    try:
+        duration = float(request.get("duration") or 30)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "bad duration"}
+    duration = max(1.0, min(duration, float(state.max_duration)))
+    try:
+        observer = DscpObserver(state.bind_host, duration)
+    except Exception as exc:
+        return {"ok": False, "error": "cannot observe: %s" % exc}
+    state.observer = observer
+    return {"ok": True, "port": observer.port,
+            "observe_dscp": observer.can_read_marks}
+
+
+def _agent_observe_report(state: "AgentState") -> Dict[str, Any]:
+    observer = state.observer
+    if observer is None:
+        return {"ok": False, "error": "not observing"}
+    report = observer.report()
+    observer.stop()
+    state.observer = None
+    report["ok"] = True
+    return report
+
+
+def verify_dscp_with_peer(client: "PeerClient", dscp: int = 46,
+                          count: int = 10) -> Dict[str, Any]:
+    """Send marked datagrams to a peer and ask what actually arrived."""
+    report: Dict[str, Any] = {
+        "peer": client.label, "sent_dscp": dscp, "packets": 0,
+        "observed_dscp": None, "survived": None, "note": None, "error": None,
+        "applied_locally": None,
+    }
+    started = client.request("observe_start", duration=max(5.0, count * 0.05 + 5))
+    if not started.get("ok"):
+        report["error"] = started.get("error") or "peer refused to observe"
+        return report
+
+    sender = None
+    try:
+        family, sockaddr = resolve_endpoint(client.host, started.get("port"),
+                                            socket.AF_UNSPEC,
+                                            socket.SOCK_DGRAM)
+        sender = socket.socket(family, socket.SOCK_DGRAM)
+        report["applied_locally"] = apply_dscp(sender, dscp, family)
+        for _ in range(max(1, count)):
+            sender.sendto(OBSERVE_MAGIC, sockaddr)
+            time.sleep(0.01)
+    except Exception as exc:
+        report["error"] = str(exc)
+    finally:
+        if sender is not None:
+            try:
+                sender.close()
+            except Exception:
+                pass
+
+    time.sleep(0.3)
+    got = client.request("observe_report")
+    if not got.get("ok"):
+        report["error"] = report["error"] or got.get("error")
+        return report
+    report["packets"] = got.get("packets") or 0
+    report["observed_dscp"] = got.get("observed_dscp")
+    report["note"] = got.get("note")
+    if report["observed_dscp"] is not None:
+        report["survived"] = dscp in report["observed_dscp"]
+    return report
+
+
+class AgentServer:
+    """Line-delimited JSON over TCP, one connection at a time.
+
+    Binds loopback unless told otherwise. Serving one conversation at a time is
+    not a throughput concern - an agent answers three requests per measurement
+    - and it keeps a stray connection from starting a second run.
+    """
+
+    def __init__(self, state: AgentState, host: str = "127.0.0.1",
+                 port: int = AGENT_DEFAULT_PORT):
+        self.state = state
+        self.host = host
+        self.port = port
+        self._sock: Optional[socket.socket] = None
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+
+    def start(self) -> int:
+        """Bind, begin serving in the background, and report the real port."""
+        family, sockaddr = resolve_endpoint(self.host, self.port,
+                                            socket.AF_UNSPEC,
+                                            socket.SOCK_STREAM)
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(sockaddr)
+        sock.listen(4)
+        sock.settimeout(0.2)
+        self._sock = sock
+        self.state.bind_host = self.host
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+        return sock.getsockname()[1]
+
+    def _serve(self) -> None:
+        while not self._stop.is_set():
+            try:
+                conn, peer = self._sock.accept()
+            except socket.timeout:
+                continue
+            except Exception:
+                if self._stop.is_set():
+                    return
+                continue
+            try:
+                self._converse(conn)
+            except Exception:
+                pass
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _converse(self, conn: "socket.socket") -> None:
+        conn.settimeout(AGENT_IO_TIMEOUT)
+        buffer = b""
+        while not self._stop.is_set():
+            if len(buffer) > AGENT_MAX_REQUEST:
+                return
+            try:
+                chunk = conn.recv(4096)
+            except Exception:
+                return
+            if not chunk:
+                return
+            buffer += chunk
+            while NEWLINE in buffer:
+                line, buffer = buffer.split(NEWLINE, 1)
+                try:
+                    request = json.loads(line.decode("utf-8"))
+                except Exception:
+                    reply = {"ok": False, "error": "malformed request"}
+                else:
+                    reply = handle_request(self.state, request)
+                try:
+                    conn.sendall(json.dumps(reply).encode("utf-8") + NEWLINE)
+                except Exception:
+                    return
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+
+
+class PeerClient:
+    """Controller side of the agent protocol."""
+
+    def __init__(self, host: str, port: int = AGENT_DEFAULT_PORT,
+                 token: str = "", label: Optional[str] = None,
+                 timeout: float = 10.0):
+        self.host = host
+        self.port = port
+        self.token = token
+        self.label = label or host
+        self.timeout = timeout
+
+    def request(self, op: str, **fields: Any) -> Dict[str, Any]:
+        """One request, one reply. Errors come back as a reply, not a raise."""
+        payload = dict(fields)
+        payload["op"] = op
+        payload["token"] = self.token
+        conn = None
+        try:
+            family, sockaddr = resolve_endpoint(self.host, self.port,
+                                                socket.AF_UNSPEC,
+                                                socket.SOCK_STREAM)
+            conn = socket.socket(family, socket.SOCK_STREAM)
+            conn.settimeout(self.timeout)
+            conn.connect(sockaddr)
+        except Exception as exc:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            return {"ok": False, "error": "cannot reach %s: %s"
+                                          % (self.label, exc)}
+        try:
+            conn.sendall(json.dumps(payload).encode("utf-8") + NEWLINE)
+            buffer = b""
+            while NEWLINE not in buffer:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return {"ok": False, "error": "%s closed the connection"
+                                                  % self.label}
+                buffer += chunk
+                if len(buffer) > AGENT_MAX_REQUEST:
+                    return {"ok": False, "error": "reply from %s too large"
+                                                  % self.label}
+            return json.loads(buffer.split(NEWLINE, 1)[0].decode("utf-8"))
+        except Exception as exc:
+            return {"ok": False, "error": "%s: %s" % (self.label, exc)}
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def parse_peer_spec(spec: str, token: str = "") -> PeerClient:
+    """Parse 'host[:port][#label]' into a client. IPv6 literals are bracketed."""
+    text = (spec or "").strip()
+    if not text:
+        raise ValueError("empty peer spec")
+    label = None
+    if "#" in text:
+        text, label = text.split("#", 1)
+        label = label.strip() or None
+        text = text.strip()
+
+    port = AGENT_DEFAULT_PORT
+    if text.startswith("["):
+        close = text.find("]")
+        if close < 0:
+            raise ValueError("unclosed bracket in peer spec: %r" % spec)
+        host = text[1:close].strip()
+        tail = text[close + 1:]
+        if tail.startswith(":"):
+            port_text = tail[1:].strip()
+        elif tail:
+            raise ValueError("junk after the address in peer spec: %r" % spec)
+        else:
+            port_text = ""
+    else:
+        bits = text.split(":")
+        if len(bits) > 2:
+            raise ValueError(
+                "too many fields in peer spec: %r - an IPv6 literal must be "
+                "bracketed, as in [fd00::5]:7419" % spec)
+        host = bits[0].strip()
+        port_text = bits[1].strip() if len(bits) > 1 else ""
+
+    if not host:
+        raise ValueError("missing host in peer spec: %r" % spec)
+    if port_text:
+        try:
+            port = int(port_text)
+        except ValueError:
+            raise ValueError("bad port in peer spec: %r" % spec)
+        if not 1 <= port <= 65535:
+            raise ValueError("port out of range in peer spec: %r" % spec)
+    return PeerClient(host, port, token, label)
+
+
+# --------------------------------------------------------------------------
 # REPORTERS
 # --------------------------------------------------------------------------
 
@@ -2627,6 +3127,13 @@ def _add_common(parser: "argparse.ArgumentParser") -> None:
                              "kind:host[:port][@dscp=NAME][#label] where kind is "
                              "tcp, dns, stun or icmp. Bracket an IPv6 literal: "
                              "tcp:[2606:4700:4700::1111]:853")
+    parser.add_argument("--peer", action="append", metavar="SPEC",
+                        help="another host running 'bufferscope agent', "
+                             "repeatable: HOST[:PORT][#label]. Bracket an "
+                             "IPv6 literal")
+    parser.add_argument("--peer-token", metavar="TOKEN",
+                        help="shared secret for --peer, or set "
+                             "BUFFERSCOPE_PEER_TOKEN")
     parser.add_argument("--family", choices=("auto", "4", "6"), default="auto",
                         help="address family for probes. auto follows the "
                              "system order; 4 or 6 forces one and fails rather "
@@ -2676,6 +3183,18 @@ def build_parser() -> argparse.ArgumentParser:
     monitor.add_argument("--on-alert", metavar="CMD",
                          help="command to run on a breach. No shell is used; "
                               "context arrives in BUFFERSCOPE_ALERT_* env vars")
+
+    agent = subparsers.add_parser(
+        "agent", help="serve probes for another bufferscope on this network")
+    agent.add_argument("--listen", default="127.0.0.1", metavar="ADDR",
+                       help="address to bind (default 127.0.0.1; widen it "
+                            "deliberately)")
+    agent.add_argument("--port", type=int, default=AGENT_DEFAULT_PORT)
+    agent.add_argument("--token", metavar="TOKEN",
+                       help="shared secret, or set BUFFERSCOPE_AGENT_TOKEN")
+    agent.add_argument("--max-duration", type=int, default=AGENT_MAX_DURATION,
+                       metavar="SECS",
+                       help="longest measurement this agent will accept")
 
     router = subparsers.add_parser(
         "router", help="list router interfaces and counters over SNMP")
@@ -2868,6 +3387,130 @@ def cmd_router(args: "argparse.Namespace") -> int:
         print("")
     print("Use --router-snmp %s to include household traffic in a measurement."
           % host)
+    return EXIT_OK
+
+
+def check_marks_on_the_wire(clients: List["PeerClient"],
+                            marking: List[Dict[str, Any]]
+                            ) -> List[Dict[str, Any]]:
+    """Ask each peer what marking actually reached it.
+
+    The socket read-back says only that the local OS accepted the mark. This
+    says whether it was still there after the router had its say, which is the
+    difference between "we asked for EF" and "EF survived".
+    """
+    marks = sorted({entry["dscp"] for entry in (marking or [])
+                    if entry.get("dscp") is not None})
+    if not clients or not marks:
+        return []
+    return [verify_dscp_with_peer(client, dscp)
+            for client in clients for dscp in marks]
+
+
+def peer_clients(args: "argparse.Namespace") -> List[PeerClient]:
+    """Peers named on the command line, sharing one token."""
+    token = (getattr(args, "peer_token", None)
+             or os.environ.get("BUFFERSCOPE_PEER_TOKEN", ""))
+    return [parse_peer_spec(spec, token)
+            for spec in (getattr(args, "peer", None) or [])]
+
+
+def start_peers(clients: List[PeerClient], specs: List[str], duration: float,
+                probe_interval: int = 20
+                ) -> List[Tuple[PeerClient, Dict[str, Any]]]:
+    """Ask each peer to probe the same targets over the same window."""
+    duration = max(1.0, min(float(duration), float(AGENT_MAX_DURATION)))
+    started = []
+    for client in clients:
+        reply = client.request("start", probes=specs, duration=duration,
+                               probe_interval=probe_interval)
+        if not reply.get("ok"):
+            print("peer %s did not start: %s"
+                  % (client.label, reply.get("error")), file=sys.stderr)
+        started.append((client, reply))
+    return started
+
+
+def collect_peers(started: List[Tuple[PeerClient, Dict[str, Any]]]
+                  ) -> List[Dict[str, Any]]:
+    """Gather each peer's samples. A peer that failed is recorded, not raised."""
+    out = []
+    for client, start_reply in started:
+        entry: Dict[str, Any] = {"label": client.label, "host": client.host}
+        if not start_reply.get("ok"):
+            entry["error"] = start_reply.get("error") or "peer refused to start"
+            out.append(entry)
+            continue
+        reply = client.request("collect")
+        if not reply.get("ok"):
+            entry["error"] = reply.get("error") or "peer collect failed"
+        else:
+            entry["os"] = reply.get("os")
+            entry["started_at"] = reply.get("started_at")
+            entry["probes"] = reply.get("probes") or {}
+        out.append(entry)
+    return out
+
+
+def render_peers(doc: Dict[str, Any]) -> str:
+    """Latency seen from other hosts, beside this one.
+
+    A gap here is the cost of the peer's own leg - Wi-Fi, powerline, a switch -
+    since both hosts crossed the same router and the same line.
+    """
+    peers = doc.get("peers") or []
+    if not peers:
+        return ""
+    idle = ((doc.get("phases") or {}).get("idle") or {}).get("probes") or {}
+    lines = ["", "peers:",
+             "  %-12s %-16s %9s %9s %9s" % ("host", "probe", "this host",
+                                            "peer", "gap")]
+    for peer in peers:
+        label = str(peer.get("label") or "?")[:12]
+        if peer.get("error"):
+            lines.append("  %-12s FAILED: %s" % (label, peer["error"]))
+            continue
+        for name in sorted(peer.get("probes") or {}):
+            here = (idle.get(name) or {}).get("p95")
+            there = (peer["probes"].get(name) or {}).get("p95")
+            gap = (there - here) if (here is not None
+                                     and there is not None) else None
+            lines.append("  %-12s %-16s %s %s %s" % (
+                label, name[:16], _fmt(here, 9), _fmt(there, 9),
+                _fmt(gap, 9)))
+    return "\n".join(lines)
+
+
+def cmd_agent(args: "argparse.Namespace") -> int:
+    """Serve probe requests for another bufferscope until interrupted."""
+    token = getattr(args, "token", None) or os.environ.get(
+        "BUFFERSCOPE_AGENT_TOKEN", "")
+    if not token:
+        print("error: an agent needs a shared token. Pass --token or set "
+              "BUFFERSCOPE_AGENT_TOKEN.", file=sys.stderr)
+        return EXIT_ERROR
+    state = AgentState(token, max_duration=args.max_duration)
+    server = AgentServer(state, host=args.listen, port=args.port)
+    try:
+        port = server.start()
+    except Exception as exc:
+        print("error: cannot listen on %s port %s: %s"
+              % (args.listen, args.port, exc), file=sys.stderr)
+        return EXIT_ERROR
+    print("bufferscope agent listening on %s port %d" % (args.listen, port),
+          file=sys.stderr)
+    if args.listen not in ("127.0.0.1", "::1", "localhost"):
+        print("reachable from the network. It answers only token-authenticated "
+              "probe requests, runs no commands and touches no files.",
+              file=sys.stderr)
+    try:
+        while True:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("(stopping)", file=sys.stderr)
+    finally:
+        server.stop()
+        state.stop()
     return EXIT_OK
 
 
@@ -3111,6 +3754,22 @@ def render_classes(result: Dict[str, Any]) -> str:
                 state = "unknown"
             lines.append("  %-16s %-8s %s" % (
                 str(entry.get("probe"))[:16], entry.get("name") or "-", state))
+    for check in result.get("dscp_wire") or []:
+        if check.get("error"):
+            lines.append("  wire check via %s failed: %s"
+                         % (check.get("peer"), check["error"]))
+        elif check.get("survived") is True:
+            lines.append("  %s arrived at %s still marked (%d packets)"
+                         % (dscp_name(check["sent_dscp"]), check.get("peer"),
+                            check.get("packets") or 0))
+        elif check.get("survived") is False:
+            lines.append("  %s reached %s STRIPPED - saw %s instead"
+                         % (dscp_name(check["sent_dscp"]), check.get("peer"),
+                            check.get("observed_dscp")))
+        else:
+            lines.append("  %s to %s: %s"
+                         % (dscp_name(check["sent_dscp"]), check.get("peer"),
+                            check.get("note") or "not verifiable"))
     return "\n".join(lines)
 
 
@@ -3126,6 +3785,12 @@ def _measure_once(args: "argparse.Namespace"):
     if not probes:
         print("error: no probe targets available", file=sys.stderr)
         return EXIT_ERROR
+
+    clients = peer_clients(args)
+    peer_runs = start_peers(
+        clients, [probe.spec for probe in probes],
+        getattr(args, "duration", None) or PEER_LOAD_WINDOW,
+        getattr(args, "probe_interval", 20)) if clients else []
 
     if args.command == "probe":
         runner = ProbeRunner(probes, args.probe_interval)
@@ -3151,7 +3816,10 @@ def _measure_once(args: "argparse.Namespace"):
         if router:
             result["devices"] = router.device_reports(
                 keep_samples=getattr(args, "raw", False))
-        _emit(result, args, render_human(result))
+        result["peers"] = collect_peers(peer_runs)
+        result["dscp_wire"] = check_marks_on_the_wire(clients,
+                                                      result.get("marking"))
+        _emit(result, args, render_human(result) + render_peers(result))
         return EXIT_OK if result["validation"]["trustworthy"] else EXIT_UNTRUSTWORTHY
 
     generator = getattr(args, "generator", "ookla")
@@ -3259,6 +3927,9 @@ def _measure_once(args: "argparse.Namespace"):
         if router:
             result["devices"] = router.device_reports(
                 keep_samples=getattr(args, "raw", False))
+    result["peers"] = collect_peers(peer_runs)
+    result["dscp_wire"] = check_marks_on_the_wire(clients,
+                                                  result.get("marking"))
     return result
 
 
@@ -3301,6 +3972,7 @@ def cmd_measure(args: "argparse.Namespace") -> int:
         text = render_human(result)
         if args.command == "classes":
             text += "\n\nCLASS VERIFICATION\n" + render_classes(result)
+        text += render_peers(result)
         _emit(result, args, text)
         return EXIT_OK if result["validation"]["trustworthy"] else EXIT_UNTRUSTWORTHY
 
@@ -3353,6 +4025,11 @@ def cmd_monitor(args: "argparse.Namespace") -> int:
     router = start_router_sampler(args, runner.origin())
     deadline = time.perf_counter() + max(1, args.duration)
     consumed = {p.name: 0 for p in probes}
+    clients = peer_clients(args)
+    peer_runs = start_peers(
+        clients, [probe.spec for probe in probes],
+        getattr(args, "duration", None) or PEER_LOAD_WINDOW,
+        getattr(args, "probe_interval", 20)) if clients else []
     alert_p95 = getattr(args, "alert_p95", None)
     alert_loss = getattr(args, "alert_loss", None)
     on_alert = getattr(args, "on_alert", None)
@@ -3400,6 +4077,9 @@ def cmd_monitor(args: "argparse.Namespace") -> int:
                           {}, started_at, mode="monitor",
                           keep_samples=getattr(args, "raw", False))
     result["marking"] = marking_report(probes)
+    result["peers"] = collect_peers(peer_runs)
+    result["dscp_wire"] = check_marks_on_the_wire(clients,
+                                                  result.get("marking"))
     result["observed_throughput"] = observed_throughput(nic.samples())
     result["router_throughput"] = router_throughput(
             router, keep_samples=getattr(args, "raw", False))
@@ -3407,7 +4087,7 @@ def cmd_monitor(args: "argparse.Namespace") -> int:
         result["devices"] = router.device_reports(
             keep_samples=getattr(args, "raw", False))
     result["alerts"] = alerts
-    _emit(result, args, render_human(result))
+    _emit(result, args, render_human(result) + render_peers(result))
     if alerts:
         return EXIT_ALERT
     return EXIT_OK if result["validation"]["trustworthy"] else EXIT_UNTRUSTWORTHY
@@ -3425,6 +4105,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_env(args)
     if args.command == "compare":
         return cmd_compare(args)
+    if args.command == "agent":
+        return cmd_agent(args)
     if args.command == "monitor":
         return cmd_monitor(args)
     if args.command in ("bufferbloat", "probe", "classes"):

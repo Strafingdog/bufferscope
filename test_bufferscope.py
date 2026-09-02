@@ -3118,3 +3118,491 @@ class TestGateway6InEnvAndProbes(unittest.TestCase):
         names = " ".join(p.name for p in probes)
         self.assertIn("192.168.1.1", names)
         self.assertNotIn("fe80::1", names)
+
+
+class TestAgentProtocol(unittest.TestCase):
+    def setUp(self):
+        self.state = bufferscope.AgentState(token="s3cret", max_duration=60)
+
+    def tearDown(self):
+        self.state.stop()
+
+    def test_request_without_a_token_is_refused(self):
+        reply = bufferscope.handle_request(self.state, {"op": "hello"})
+        self.assertFalse(reply["ok"])
+        self.assertIn("unauthorised", reply["error"])
+
+    def test_request_with_the_wrong_token_is_refused(self):
+        reply = bufferscope.handle_request(
+            self.state, {"op": "hello", "token": "guess"})
+        self.assertFalse(reply["ok"])
+        self.assertIn("unauthorised", reply["error"])
+
+    def test_hello_reports_version_and_capabilities(self):
+        reply = bufferscope.handle_request(
+            self.state, {"op": "hello", "token": "s3cret"})
+        self.assertTrue(reply["ok"])
+        self.assertEqual(reply["bufferscope_version"], bufferscope.VERSION)
+        self.assertEqual(reply["schema_version"], bufferscope.SCHEMA_VERSION)
+        self.assertIn("observe_dscp", reply["capabilities"])
+
+    def test_unknown_op_is_named_in_the_error(self):
+        reply = bufferscope.handle_request(
+            self.state, {"op": "rm -rf", "token": "s3cret"})
+        self.assertFalse(reply["ok"])
+        self.assertIn("rm -rf", reply["error"])
+
+    def test_start_rejects_an_unparseable_probe(self):
+        reply = bufferscope.handle_request(self.state, {
+            "op": "start", "token": "s3cret", "duration": 1,
+            "probes": ["banana:1.1.1.1"]})
+        self.assertFalse(reply["ok"])
+        self.assertIn("banana", reply["error"])
+
+    def test_start_refuses_a_duration_over_the_cap(self):
+        reply = bufferscope.handle_request(self.state, {
+            "op": "start", "token": "s3cret", "duration": 99999,
+            "probes": ["tcp:127.0.0.1:9"]})
+        self.assertFalse(reply["ok"])
+        self.assertIn("duration", reply["error"])
+
+    def test_start_then_collect_returns_probe_statistics(self):
+        with _tcp_listener() as port:
+            started = bufferscope.handle_request(self.state, {
+                "op": "start", "token": "s3cret", "duration": 2,
+                "probe_interval": 50,
+                "probes": ["tcp:127.0.0.1:%d#peer" % port]})
+            self.assertTrue(started["ok"], started.get("error"))
+            time.sleep(1.0)
+            reply = bufferscope.handle_request(
+                self.state, {"op": "collect", "token": "s3cret"})
+        self.assertTrue(reply["ok"])
+        self.assertIn("peer", reply["probes"])
+        self.assertGreater(reply["probes"]["peer"]["n"], 0)
+
+    def test_collect_before_start_is_an_error(self):
+        reply = bufferscope.handle_request(
+            self.state, {"op": "collect", "token": "s3cret"})
+        self.assertFalse(reply["ok"])
+        self.assertIn("not running", reply["error"])
+
+    def test_starting_twice_is_refused(self):
+        first = bufferscope.handle_request(self.state, {
+            "op": "start", "token": "s3cret", "duration": 2,
+            "probes": ["tcp:127.0.0.1:9"]})
+        self.assertTrue(first["ok"])
+        second = bufferscope.handle_request(self.state, {
+            "op": "start", "token": "s3cret", "duration": 2,
+            "probes": ["tcp:127.0.0.1:9"]})
+        self.assertFalse(second["ok"])
+        self.assertIn("already", second["error"])
+
+    def test_an_empty_probe_list_is_refused(self):
+        reply = bufferscope.handle_request(self.state, {
+            "op": "start", "token": "s3cret", "duration": 1, "probes": []})
+        self.assertFalse(reply["ok"])
+        self.assertIn("no probes", reply["error"])
+
+
+class TestAgentRequiresAToken(unittest.TestCase):
+    def test_an_agent_cannot_be_built_without_a_token(self):
+        with self.assertRaises(ValueError):
+            bufferscope.AgentState(token="")
+
+
+@contextlib.contextmanager
+def _agent_on_loopback(token="s3cret", max_duration=60):
+    state = bufferscope.AgentState(token=token, max_duration=max_duration)
+    server = bufferscope.AgentServer(state, host="127.0.0.1", port=0)
+    port = server.start()
+    try:
+        yield port, state
+    finally:
+        server.stop()
+        state.stop()
+
+
+class TestAgentServer(unittest.TestCase):
+    def test_hello_over_tcp(self):
+        with _agent_on_loopback() as (port, _):
+            client = bufferscope.PeerClient("127.0.0.1", port, "s3cret")
+            reply = client.request("hello")
+        self.assertTrue(reply["ok"])
+        self.assertEqual(reply["bufferscope_version"], bufferscope.VERSION)
+
+    def test_a_bad_token_is_refused_over_tcp(self):
+        with _agent_on_loopback() as (port, _):
+            client = bufferscope.PeerClient("127.0.0.1", port, "wrong")
+            reply = client.request("hello")
+        self.assertFalse(reply["ok"])
+        self.assertIn("unauthorised", reply["error"])
+
+    def test_garbage_does_not_kill_the_server(self):
+        with _agent_on_loopback() as (port, _):
+            raw = socket.create_connection(("127.0.0.1", port), timeout=5)
+            raw.sendall(b"this is not json\n")
+            raw.close()
+            client = bufferscope.PeerClient("127.0.0.1", port, "s3cret")
+            reply = client.request("hello")
+        self.assertTrue(reply["ok"])
+
+    def test_a_full_measurement_cycle_over_tcp(self):
+        with _tcp_listener() as target:
+            with _agent_on_loopback() as (port, _):
+                client = bufferscope.PeerClient("127.0.0.1", port, "s3cret")
+                started = client.request(
+                    "start", probes=["tcp:127.0.0.1:%d#peer" % target],
+                    duration=2, probe_interval=50)
+                self.assertTrue(started["ok"], started.get("error"))
+                time.sleep(1.0)
+                collected = client.request("collect")
+        self.assertTrue(collected["ok"])
+        self.assertGreater(collected["probes"]["peer"]["n"], 0)
+
+
+class TestPeerSpec(unittest.TestCase):
+    def test_host_and_port(self):
+        peer = bufferscope.parse_peer_spec("192.168.1.50:7419")
+        self.assertEqual((peer.host, peer.port), ("192.168.1.50", 7419))
+
+    def test_default_port_is_used(self):
+        peer = bufferscope.parse_peer_spec("192.168.1.50")
+        self.assertEqual(peer.port, bufferscope.AGENT_DEFAULT_PORT)
+
+    def test_label_after_hash(self):
+        peer = bufferscope.parse_peer_spec("192.168.1.50:7419#laptop")
+        self.assertEqual(peer.label, "laptop")
+
+    def test_label_defaults_to_the_host(self):
+        self.assertEqual(bufferscope.parse_peer_spec("192.168.1.50").label,
+                         "192.168.1.50")
+
+    def test_ipv6_literal_must_be_bracketed(self):
+        peer = bufferscope.parse_peer_spec("[fd00::5]:7419#nas")
+        self.assertEqual((peer.host, peer.port, peer.label),
+                         ("fd00::5", 7419, "nas"))
+
+    def test_unbracketed_ipv6_is_rejected(self):
+        with self.assertRaises(ValueError) as caught:
+            bufferscope.parse_peer_spec("fd00::5:7419")
+        self.assertIn("bracket", str(caught.exception).lower())
+
+    def test_empty_spec_is_rejected(self):
+        with self.assertRaises(ValueError):
+            bufferscope.parse_peer_spec("")
+
+
+class TestAgentCli(CliMixin, unittest.TestCase):
+    def test_agent_without_a_token_is_refused(self):
+        code, _, err = self._run(["agent", "--port", "0"])
+        self.assertEqual(code, bufferscope.EXIT_ERROR)
+        self.assertIn("token", err.lower())
+
+    def test_agent_defaults_to_loopback(self):
+        args = bufferscope.build_parser().parse_args(["agent"])
+        self.assertEqual(args.listen, "127.0.0.1")
+
+    def test_agent_port_defaults_to_the_agreed_one(self):
+        args = bufferscope.build_parser().parse_args(["agent"])
+        self.assertEqual(args.port, bufferscope.AGENT_DEFAULT_PORT)
+
+
+class TestProbeSpecRoundTrip(unittest.TestCase):
+    """Peers are told what to probe, so a probe must remember its own spec."""
+
+    def test_labelled_probe_keeps_its_spec(self):
+        probe = bufferscope.parse_probe_spec("tcp:1.1.1.1:853#control")
+        self.assertEqual(probe.name, "control")
+        self.assertEqual(probe.spec, "tcp:1.1.1.1:853#control")
+
+    def test_built_probe_spec_parses_back(self):
+        probes = bufferscope.build_probes(["1.1.1.1"], "192.168.1.1", False)
+        for probe in probes:
+            again = bufferscope.parse_probe_spec(probe.spec)
+            self.assertEqual(again.name, probe.name)
+
+
+class TestPeerIntegration(CliMixin, unittest.TestCase):
+    def setUp(self):
+        self._env = bufferscope.collect_env
+        bufferscope.collect_env = lambda: {"os": "test", "gateway": None,
+                                           "gateway6": None,
+                                           "icmp_available": False}
+        self._find = bufferscope.find_speedtest
+        bufferscope.find_speedtest = lambda: None
+
+    def tearDown(self):
+        bufferscope.collect_env = self._env
+        bufferscope.find_speedtest = self._find
+
+    def test_probe_run_gathers_latency_from_a_peer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "p.json")
+            with _tcp_listener() as target:
+                with _agent_on_loopback() as (agent_port, _):
+                    self._run([
+                        "probe", "--duration", "2", "--probe-interval", "50",
+                        "--no-gateway", "--out", path,
+                        "--probe", "tcp:127.0.0.1:%d#target" % target,
+                        "--peer", "127.0.0.1:%d#laptop" % agent_port,
+                        "--peer-token", "s3cret"])
+            with open(path) as handle:
+                doc = json.load(handle)
+        self.assertEqual(len(doc["peers"]), 1)
+        peer = doc["peers"][0]
+        self.assertEqual(peer["label"], "laptop")
+        self.assertGreater(peer["probes"]["target"]["n"], 0)
+
+    def test_an_unreachable_peer_is_reported_not_fatal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "p.json")
+            with _tcp_listener() as target:
+                code, _, err = self._run([
+                    "probe", "--duration", "1", "--probe-interval", "50",
+                    "--no-gateway", "--out", path,
+                    "--probe", "tcp:127.0.0.1:%d#target" % target,
+                    "--peer", "127.0.0.1:1#dead", "--peer-token", "s3cret"])
+            with open(path) as handle:
+                doc = json.load(handle)
+        self.assertIn(code, (bufferscope.EXIT_OK,
+                             bufferscope.EXIT_UNTRUSTWORTHY))
+        self.assertTrue(doc["peers"][0]["error"])
+
+    def test_a_peer_with_the_wrong_token_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "p.json")
+            with _tcp_listener() as target:
+                with _agent_on_loopback() as (agent_port, _):
+                    self._run([
+                        "probe", "--duration", "1", "--probe-interval", "50",
+                        "--no-gateway", "--out", path,
+                        "--probe", "tcp:127.0.0.1:%d#target" % target,
+                        "--peer", "127.0.0.1:%d#laptop" % agent_port,
+                        "--peer-token", "wrong"])
+            with open(path) as handle:
+                doc = json.load(handle)
+        self.assertIn("unauthorised", doc["peers"][0]["error"])
+
+
+class TestRenderPeers(unittest.TestCase):
+    def _doc(self):
+        return {
+            "phases": {"idle": {"probes": {"target": {"p95": 5.0, "n": 10}}}},
+            "peers": [{"label": "laptop", "host": "192.168.1.50",
+                       "os": "Linux 6.1",
+                       "probes": {"target": {"p95": 12.0, "n": 10}}}],
+        }
+
+    def test_peer_rows_show_the_gap_to_this_host(self):
+        text = bufferscope.render_peers(self._doc())
+        self.assertIn("laptop", text)
+        self.assertIn("target", text)
+        text.encode("ascii")
+
+    def test_no_peers_renders_nothing(self):
+        self.assertEqual(bufferscope.render_peers({"phases": {}}), "")
+
+    def test_a_failed_peer_is_shown_as_failed(self):
+        doc = {"phases": {}, "peers": [{"label": "nas", "host": "h",
+                                        "error": "cannot reach nas"}]}
+        text = bufferscope.render_peers(doc)
+        self.assertIn("cannot reach nas", text)
+
+
+class TestDscpFromAncillary(unittest.TestCase):
+    def test_single_byte_tos_becomes_a_dscp(self):
+        anc = [(socket.IPPROTO_IP, bufferscope.IP_RECVTOS_CMSG, bytes([184]))]
+        self.assertEqual(bufferscope.dscp_from_ancillary(anc), 46)
+
+    def test_four_byte_tos_becomes_a_dscp(self):
+        anc = [(socket.IPPROTO_IP, bufferscope.IP_RECVTOS_CMSG,
+                (184).to_bytes(4, "little"))]
+        self.assertEqual(bufferscope.dscp_from_ancillary(anc), 46)
+
+    def test_ipv6_traffic_class_is_read(self):
+        anc = [(socket.IPPROTO_IPV6, bufferscope.IPV6_TCLASS, bytes([184]))]
+        self.assertEqual(bufferscope.dscp_from_ancillary(anc), 46)
+
+    def test_unmarked_packet_reads_as_zero(self):
+        anc = [(socket.IPPROTO_IP, bufferscope.IP_RECVTOS_CMSG, bytes([0]))]
+        self.assertEqual(bufferscope.dscp_from_ancillary(anc), 0)
+
+    def test_no_ancillary_data_is_unknown(self):
+        self.assertIsNone(bufferscope.dscp_from_ancillary([]))
+
+    def test_unrelated_ancillary_data_is_unknown(self):
+        self.assertIsNone(bufferscope.dscp_from_ancillary(
+            [(socket.SOL_SOCKET, 1, bytes([1]))]))
+
+
+class TestObserveOps(unittest.TestCase):
+    def setUp(self):
+        self.state = bufferscope.AgentState(token="s3cret", max_duration=60)
+
+    def tearDown(self):
+        self.state.stop()
+
+    def test_observe_start_needs_the_token(self):
+        reply = bufferscope.handle_request(self.state, {"op": "observe_start"})
+        self.assertFalse(reply["ok"])
+
+    def test_observe_start_reports_a_port_and_the_capability(self):
+        reply = bufferscope.handle_request(
+            self.state, {"op": "observe_start", "token": "s3cret",
+                         "duration": 5})
+        self.assertTrue(reply["ok"], reply.get("error"))
+        self.assertGreater(reply["port"], 0)
+        self.assertEqual(reply["observe_dscp"], bufferscope.can_observe_dscp())
+
+    def test_observe_report_before_start_is_an_error(self):
+        reply = bufferscope.handle_request(
+            self.state, {"op": "observe_report", "token": "s3cret"})
+        self.assertFalse(reply["ok"])
+        self.assertIn("not observing", reply["error"])
+
+    def test_report_says_why_when_the_os_cannot_read_marks(self):
+        real = bufferscope.can_observe_dscp
+        bufferscope.can_observe_dscp = lambda: False
+        try:
+            started = bufferscope.handle_request(
+                self.state, {"op": "observe_start", "token": "s3cret",
+                             "duration": 5})
+            self.assertFalse(started["observe_dscp"])
+            report = bufferscope.handle_request(
+                self.state, {"op": "observe_report", "token": "s3cret"})
+        finally:
+            bufferscope.can_observe_dscp = real
+        self.assertTrue(report["ok"])
+        self.assertIsNone(report["observed_dscp"])
+        self.assertIn("cannot report", report["note"])
+
+    def test_packets_are_counted_even_without_mark_visibility(self):
+        started = bufferscope.handle_request(
+            self.state, {"op": "observe_start", "token": "s3cret",
+                         "duration": 5})
+        port = started["port"]
+        sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            for _ in range(3):
+                sender.sendto(bufferscope.OBSERVE_MAGIC, ("127.0.0.1", port))
+        finally:
+            sender.close()
+        time.sleep(0.5)
+        report = bufferscope.handle_request(
+            self.state, {"op": "observe_report", "token": "s3cret"})
+        self.assertTrue(report["ok"])
+        self.assertGreaterEqual(report["packets"], 1)
+
+    @unittest.skipUnless(bufferscope.can_observe_dscp(),
+                         "this OS cannot report a received DSCP")
+    def test_a_marked_packet_arrives_carrying_its_mark(self):
+        started = bufferscope.handle_request(
+            self.state, {"op": "observe_start", "token": "s3cret",
+                         "duration": 5})
+        port = started["port"]
+        sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            bufferscope.apply_dscp(sender, 46, socket.AF_INET)
+            for _ in range(3):
+                sender.sendto(bufferscope.OBSERVE_MAGIC, ("127.0.0.1", port))
+        finally:
+            sender.close()
+        time.sleep(0.5)
+        report = bufferscope.handle_request(
+            self.state, {"op": "observe_report", "token": "s3cret"})
+        self.assertIn(46, report["observed_dscp"])
+
+
+class TestVerifyDscpEndToEnd(unittest.TestCase):
+    def test_verification_against_a_local_agent(self):
+        with _agent_on_loopback() as (port, _):
+            client = bufferscope.PeerClient("127.0.0.1", port, "s3cret",
+                                            label="laptop")
+            report = bufferscope.verify_dscp_with_peer(client, dscp=46,
+                                                       count=5)
+        self.assertEqual(report["peer"], "laptop")
+        self.assertEqual(report["sent_dscp"], 46)
+        self.assertGreaterEqual(report["packets"], 1)
+        if bufferscope.can_observe_dscp():
+            self.assertIs(report["survived"], True)
+        else:
+            self.assertIsNone(report["survived"])
+            self.assertIn("cannot report", report["note"])
+
+    def test_an_unreachable_peer_reports_an_error(self):
+        client = bufferscope.PeerClient("127.0.0.1", 1, "s3cret", label="dead")
+        report = bufferscope.verify_dscp_with_peer(client, dscp=46, count=2)
+        self.assertTrue(report["error"])
+
+
+class TestPeerClientCleansUp(unittest.TestCase):
+    """A monitor may retry a dead peer for hours; leaking a socket each time
+    would eventually exhaust the process."""
+
+    def test_a_failed_connection_closes_its_socket(self):
+        created = []
+        real = socket.socket
+
+        class Recorder(real):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                created.append(self)
+
+        socket.socket = Recorder
+        try:
+            client = bufferscope.PeerClient("127.0.0.1", 1, "t", label="dead")
+            reply = client.request("hello")
+        finally:
+            socket.socket = real
+        self.assertFalse(reply["ok"])
+        self.assertTrue(created, "no socket was created")
+        for sock in created:
+            self.assertEqual(sock.fileno(), -1,
+                             "socket left open after a failed connect")
+
+
+class TestDscpWireInRun(CliMixin, unittest.TestCase):
+    def setUp(self):
+        self._env = bufferscope.collect_env
+        bufferscope.collect_env = lambda: {"os": "test", "gateway": None,
+                                           "gateway6": None,
+                                           "icmp_available": False}
+        self._find = bufferscope.find_speedtest
+        bufferscope.find_speedtest = lambda: None
+
+    def tearDown(self):
+        bufferscope.collect_env = self._env
+        bufferscope.find_speedtest = self._find
+
+    def _run_probe(self, spec, extra):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "p.json")
+            with _tcp_listener() as target:
+                self._run(["probe", "--duration", "1", "--probe-interval",
+                           "50", "--no-gateway", "--out", path,
+                           "--probe", spec % target] + extra)
+            with open(path) as handle:
+                return json.load(handle)
+
+    def test_marked_probe_with_a_peer_checks_the_wire(self):
+        with _agent_on_loopback() as (agent_port, _):
+            doc = self._run_probe(
+                "tcp:127.0.0.1:%d@dscp=ef#voice",
+                ["--peer", "127.0.0.1:%d#laptop" % agent_port,
+                 "--peer-token", "s3cret"])
+        self.assertEqual(len(doc["dscp_wire"]), 1)
+        entry = doc["dscp_wire"][0]
+        self.assertEqual(entry["sent_dscp"], 46)
+        self.assertEqual(entry["peer"], "laptop")
+
+    def test_unmarked_run_with_a_peer_checks_nothing(self):
+        with _agent_on_loopback() as (agent_port, _):
+            doc = self._run_probe(
+                "tcp:127.0.0.1:%d#plain",
+                ["--peer", "127.0.0.1:%d#laptop" % agent_port,
+                 "--peer-token", "s3cret"])
+        self.assertEqual(doc["dscp_wire"], [])
+
+    def test_marked_run_without_a_peer_checks_nothing(self):
+        doc = self._run_probe("tcp:127.0.0.1:%d@dscp=ef#voice", [])
+        self.assertEqual(doc["dscp_wire"], [])

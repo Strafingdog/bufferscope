@@ -142,6 +142,16 @@ Lists the interfaces the router exposes over SNMP, identifies the busiest one
 which measurement windows it can support. Run this once when setting up
 `--router-snmp`. See [Seeing the whole household](#seeing-the-whole-household-not-just-this-pc).
 
+### `agent` - lend this machine's view to a run on another
+
+```
+$ BUFFERSCOPE_AGENT_TOKEN=... python bufferscope.py agent --listen 0.0.0.0
+```
+
+Answers probe requests from another bufferscope so a run can measure latency
+from more than one place at once. See
+[Measuring from more than one host](#measuring-from-more-than-one-host).
+
 ### `env` - what bufferscope detected about this machine
 
 ```
@@ -174,6 +184,35 @@ That is a real result: enabling hardware QoS cost 67 Mbps of upload and removed
 terms - losing upload throughput is "worse" even when it is the price of a
 change you want - so you weigh the trade rather than being handed a verdict.
 
+#### Pooling several arms a side
+
+One arm a side is rarely enough. Conditions drift between arms - the evening
+gets busier, the route changes, a neighbour starts streaming - and on the line
+this was built for the **between-arm** standard deviation was 4.59 ms, larger
+than the spread within any single arm. Three arms a side is the working rule.
+
+```
+$ python bufferscope.py compare -a off-1.json off-2.json off-3.json \
+                                -b on-1.json  on-2.json  on-3.json
+```
+
+```
+pooled: A = 3 arms (24 runs)   B = 3 arms (23 runs)
+each arm contributes its own mean, so the interval carries between-arm spread
+
+metric                         A mean     B mean       diff  95% CI of diff
+upload/teams-class1             37.66      26.70     -10.96  [-20.1, -1.8]  SIGNIFICANT - better
+```
+
+**Pooling is by arm, not by run,** and the distinction decides verdicts. Runs
+inside one arm share their conditions, so treating 24 runs as 24 independent
+replicates would shrink the interval by roughly the square root of the number
+of runs per arm and manufacture significance that is not there. Each arm
+therefore contributes one number - its own mean - and the interval carries the
+disagreement *between* arms, which is the noise you actually have to beat.
+
+The positional two-file form still works and is unchanged.
+
 ### Options
 
 ```
@@ -199,7 +238,24 @@ change you want - so you weigh the trade rather than being handed a verdict.
 --generator NAME        ookla (default) or librespeed
 --ls-concurrent N       librespeed parallel streams (default 8)
 --ls-duration SECS      librespeed per-direction duration (default 15)
+--family {auto,4,6}     address family for probes (default auto)
+--peer SPEC             another host running 'agent', repeatable:
+                        HOST[:PORT][#label]
+--peer-token TOKEN      shared secret for --peer, or $BUFFERSCOPE_PEER_TOKEN
 ```
+
+`monitor` adds:
+
+```
+--alert-p95 MS          alert when an interval p95 exceeds MS
+--alert-loss PCT        alert when an interval loss exceeds PCT
+--alert-cooldown SECS   minimum gap between commands for one probe and
+                        metric (default 300)
+--on-alert CMD          command to run on a breach; no shell is used
+```
+
+`compare` adds `-a/--arm-a` and `-b/--arm-b`, each taking several files.
+`agent` takes `--listen`, `--port`, `--token` and `--max-duration`.
 
 ### Choosing the load generator
 
@@ -229,6 +285,30 @@ so this will not announce itself. If you are tuning egress near gigabit, use
 Ookla.
 
 Runs recorded before this option existed are treated as Ookla, which they were.
+
+### IPv6
+
+Probes follow the system's address selection by default. `--family 4` or
+`--family 6` forces one, and forcing a family the target does not have fails
+rather than quietly falling back - which is what makes it a check rather than a
+preference.
+
+```
+$ python bufferscope.py probe --family 6 --targets 2606:4700:4700::1111
+```
+
+An IPv6 literal in a probe spec must be bracketed, because otherwise there is
+no telling an address from a port:
+
+```
+--probe tcp:[2606:4700:4700::1111]:853#control
+```
+
+Marking on IPv6 goes to `IPV6_TCLASS` rather than the IPv4 ToS byte, ICMP
+becomes ICMPv6, and gateway detection finds the v6 default route with its scope
+attached - a `fe80::` gateway is unreachable without the interface it belongs
+to. A `--family 6` run probes the v6 gateway, since attributing delay to a
+router leg the traffic never crossed would be worse than not measuring it.
 
 ### `--repeat N` - the flag that makes tuning honest
 
@@ -334,6 +414,49 @@ export BUFFERSCOPE_SNMP_COMMUNITY="your-read-community"     # or setx on Windows
 The community is read from the environment, never written to a result file and
 never logged. `--snmp-community` overrides it if you must.
 
+### Measuring from more than one host
+
+`--router-snmp` gives household-wide *throughput*, but latency still comes from
+whichever machine you ran the command on. To see what the connection feels like
+from the laptop on Wi-Fi while the desktop saturates the line, run an agent
+there and point the run at it.
+
+On the second machine:
+
+```
+$ export BUFFERSCOPE_AGENT_TOKEN=$(python -c "import secrets;print(secrets.token_urlsafe(24))")
+$ python bufferscope.py agent --listen 0.0.0.0
+bufferscope agent listening on 0.0.0.0 port 7419
+```
+
+On the machine generating load:
+
+```
+$ export BUFFERSCOPE_PEER_TOKEN=...same token...
+$ python bufferscope.py bufferbloat --peer 192.168.1.50#laptop
+```
+
+```
+peers:
+  host         probe            this host      peer       gap
+  laptop       icmp:1.1.1.1          5.11     31.40     26.29
+  laptop       icmp:192.168.1.1      1.20      3.10      1.90
+```
+
+Both hosts crossed the same router and the same line, so the gap is the cost of
+the peer's own leg - Wi-Fi, powerline, a cheap switch. A peer that cannot be
+reached, or answers with the wrong token, is recorded in the result and the run
+carries on; it never aborts the measurement.
+
+**What the agent is, and is not.** It runs in the foreground for the duration
+of a measurement and exits. It is not installed as a service, does not start at
+boot, and does not run unattended. It binds `127.0.0.1` unless you widen it on
+purpose, a shared token is mandatory rather than optional, it serves one
+connection at a time, and the entire vocabulary is start a probe, report what
+the probe saw, observe a marking, stop. It runs no commands and touches no
+files. Probe specs arrive as text and go through the same parser the CLI uses,
+which can only name a host, a port and a marking.
+
 ### Polling more than one device
 
 A mesh or multi-AP network has no single vantage point - the gateway sees the
@@ -425,6 +548,35 @@ The practical rule: **router data is authoritative for passive observation over
 minutes, and unsuitable for individual speedtest phases.** `probe` and `monitor`
 are where it earns its place.
 
+### Alerting from `monitor`
+
+A monitor left running overnight is only useful if it tells you when something
+happened.
+
+```
+$ python bufferscope.py monitor --duration 86400 --alert-p95 50 \
+      --on-alert "curl -s -d bufferbloat https://ntfy.sh/my-topic"
+```
+
+```
+12:04:31  p95  4.9 ms  ok
+ALERT  icmp:1.1.1.1 p95 62.30 over threshold 50.00
+       on-alert command ok
+```
+
+A breach prints to stderr, is recorded in the result under `alerts`, and sets
+**exit code 3**, so a scheduled run can be checked without parsing output.
+
+`--on-alert` runs **without a shell**, and the breach values are never
+interpolated into the command - they arrive as `BUFFERSCOPE_ALERT_PROBE`,
+`_METRIC`, `_VALUE`, `_THRESHOLD` and `_AT` in the environment. A notifier that
+fails is reported and the monitor keeps measuring, because losing the
+measurement to a broken webhook would be the worse outcome.
+
+`--alert-cooldown` (default 300 s) holds down repeat commands for the same
+probe and metric, so a bad hour notifies you once rather than sixty times. The
+alert records themselves are never suppressed - only the command is.
+
 ## The QoS tuning workflow
 
 1. `bufferscope.py bufferbloat --repeat 8 --server-id ID --out baseline.json`
@@ -444,6 +596,26 @@ keep it for the whole tuning session.
 number and a wrong conclusion; see the section above.
 
 ### Verifying classification rules
+
+Marking a probe is only half of it. bufferscope reads the mark back off the
+socket after setting it, so a marking the OS refused - Windows commonly ignores
+`IP_TOS` without a QoS policy - is reported as `NOT applied` rather than
+quietly producing a comparison that cannot speak to QoS at all. With a
+`--peer`, it goes further and asks the far end what marking actually arrived:
+
+```
+marked probe       dscp     applied
+  voice            ef       yes
+  ef arrived at laptop still marked (10 packets)
+```
+
+or, honestly, when the peer's OS cannot see it:
+
+```
+  ef to laptop: this OS cannot report the marking of a received packet, so
+  the mark could not be checked on the wire
+```
+
 
 `classes` probes each QoS rule with traffic that should match it, alongside a
 **control** on a port no rule matches:
@@ -542,6 +714,7 @@ Exit codes:
 | 0 | Success; result trustworthy |
 | 1 | Error - missing dependency, no targets, speedtest failure |
 | 2 | Completed, but the result is **not** trustworthy |
+| 3 | `monitor` only: an alert threshold was breached |
 
 Exit 2 means the measurement completed but bufferscope does not stand behind it. The
 reasons are printed and included in the JSON. Rules that trigger it:
@@ -579,7 +752,8 @@ throughput timeline instead of the load generator's own phase claims.
                           // predate the option, which were ookla
   "env": {
     "os", "python", "bufferscope_version", "schema_version",
-    "gateway",            // detected default gateway, or null
+    "gateway",            // detected IPv4 default gateway, or null
+    "gateway6",           // IPv6 default gateway, scope included, or null
     "interfaces",         // name -> {rx_bytes, tx_bytes}
     "speedtest_path", "speedtest_version",
     "icmp_available"      // false when unprivileged
@@ -611,6 +785,23 @@ throughput timeline instead of the load generator's own phase claims.
     "overall_grade"
   },
   "validation": {"trustworthy": bool, "reasons": [str]},
+  "marking": [            // one entry per marked probe
+    {"probe", "dscp", "name",
+     "applied"}          // false when the OS refused the mark
+  ],
+  "dscp_wire": [          // present with --peer and a marked probe
+    {"peer", "sent_dscp", "packets", "observed_dscp",
+     "survived",         // null when the peer's OS cannot tell
+     "note", "error"}
+  ],
+  "peers": [              // present with --peer
+    {"label", "host", "os", "started_at",
+     "probes": {"<probe name>": { ...same stats as above... }},
+     "error"}            // present instead, if that peer failed
+  ],
+  "alerts": [             // monitor only
+    {"probe", "metric", "value", "threshold", "at"}
+  ],
   "devices": [            // present with --router-snmp / --snmp-device
     {"label", "host", "down_mbps", "up_mbps", "interface",
      "sample_count", "source": "snmp",
@@ -685,10 +876,11 @@ existed carry `repeat` as `{"n": N}` alone.
 
 ## Limitations
 
-- **Latency is measured from one host.** It includes this machine's own network
-  stack. To rule that out, run `probe` on a second device while this one
-  generates load. Throughput can now be measured household-wide via
-  `--router-snmp`, but latency cannot.
+- **Latency still comes from hosts, not from the router.** A measurement
+  includes the measuring machine's own network stack. `--peer` puts a second
+  and third host in the picture, and `--router-snmp` covers throughput
+  household-wide, but nothing here measures latency the way the router
+  experiences it.
 - **Router counters are coarse.** See the granularity note above. bufferscope
   declines to report rather than reporting a biased figure.
 - **ICMP needs privileges.** Raw sockets require root on Linux/macOS and admin on
@@ -698,19 +890,26 @@ existed carry `repeat` as `{"n": N}` alone.
   and abandoned: providers rate-limit concurrent connections per source IP well
   below a gigabit, silently capping the load and invalidating results. Ookla or
   LibreSpeed does the saturating instead.
-- **IPv4 only.** No IPv6-specific handling.
+- **A received DSCP cannot be read on every OS.** The mark a probe asked for is
+  read back off the socket everywhere, so a refusal is never silent. Confirming
+  that the mark was still there *on arrival* needs `recvmsg`, which Windows
+  does not implement: a Windows peer reports that it cannot tell rather than
+  reporting an unmarked packet as though the router had stripped it.
 - **Not a router configuration tool.** It measures; you make the changes.
 
 ## Testing
 
 ```bash
-python -m unittest test_bufferscope -v          # 239 tests, offline
+python -m unittest test_bufferscope -v          # 359 tests, offline
 BUFFERSCOPE_E2E=1 python -m unittest test_bufferscope.TestEndToEnd -v
 ```
 
 The default suite requires no network, no root and no particular OS - platform
 parsers are tested against captured command output from Windows, Linux and
-macOS. The end-to-end test is opt-in, takes about 20 seconds and uses roughly
+macOS. Agent and peer tests run a real server on loopback rather than mocking
+the protocol. Two tests skip themselves where the platform cannot support them:
+reading a received DSCP needs `recvmsg`, and the IPv6 socket tests need a
+usable `::1`. The end-to-end test is opt-in, takes about 20 seconds and uses roughly
 1.4 GB of data.
 
 ## Licence
