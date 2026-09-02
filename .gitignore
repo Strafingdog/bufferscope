@@ -21,3 +21,7 @@ venv/
 *.swp
 Thumbs.db
 desktop.ini
+
+# Stray logs from running an agent in the foreground
+agent.log
+*.log
