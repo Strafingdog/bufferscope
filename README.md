@@ -51,7 +51,9 @@ three times before the arms above were run properly.
 ## Requirements
 
 - **Python 3.9+** - no `pip install`, standard library only
-- **Ookla Speedtest CLI** - required; generates the saturating load
+- **A load generator** - one of the two below, to saturate the link
+
+**Ookla Speedtest CLI**, the default:
 
 ```bash
 winget install Ookla.Speedtest.CLI     # Windows
@@ -59,8 +61,16 @@ brew install speedtest-cli             # macOS
 apt install speedtest-cli              # Debian/Ubuntu
 ```
 
-bufferscope finds the binary automatically on PATH or in the usual install
-locations. Nothing is hardcoded.
+**LibreSpeed CLI**, optional, selected with `--generator librespeed`:
+
+```bash
+winget install LibreSpeed.librespeed-cli    # Windows
+# or a release binary from https://github.com/librespeed/speedtest-cli
+```
+
+bufferscope finds either binary automatically on PATH or in the usual install
+locations. Nothing is hardcoded. See
+[Choosing the load generator](#choosing-the-load-generator) for which to use.
 
 ## Install
 
@@ -121,6 +131,17 @@ $ python bufferscope.py monitor --duration 3600 --interval 60
 One summary line per probe per interval, then a final aggregate. Ctrl-C exits
 cleanly and still writes a complete result.
 
+### `router` - list the router's interfaces and counters
+
+```
+$ python bufferscope.py router
+```
+
+Lists the interfaces the router exposes over SNMP, identifies the busiest one
+(usually the WAN), and reports the measured counter refresh rate so you know
+which measurement windows it can support. Run this once when setting up
+`--router-snmp`. See [Seeing the whole household](#seeing-the-whole-household-not-just-this-pc).
+
 ### `env` - what bufferscope detected about this machine
 
 ```
@@ -173,8 +194,41 @@ change you want - so you weigh the trade rather than being handed a verdict.
 --snmp-interface NAME   router interface to measure (default: busiest)
 --snmp-port N           default 161
 --snmp-device SPEC      extra SNMP target, repeatable (see below)
+--probe SPEC            probe spec, repeatable, replaces the default set
 --raw                   include the full latency sample series in the JSON
+--generator NAME        ookla (default) or librespeed
+--ls-concurrent N       librespeed parallel streams (default 8)
+--ls-duration SECS      librespeed per-direction duration (default 15)
 ```
+
+### Choosing the load generator
+
+`--generator ookla` (the default) or `--generator librespeed`. Every saved run
+records which one produced it, and `compare` warns when two documents disagree,
+because latency measured through two generators is not the same measurement: on
+one line, minutes apart, Ookla reported download +3.9 ms / upload +26.5 ms where
+Waveform reported +11.3 / +3.6.
+
+**Ookla** pins to a chosen server with `--server-id`, which is what makes one
+arm comparable to the arm before it. It also rate-limits per source address
+aggressively enough to abort a long `--repeat` arm part way through.
+
+**LibreSpeed** is not rate-limited, so it will finish an arm that Ookla refuses.
+It publishes no phase event stream, so bufferscope runs `--no-upload` and then
+`--no-download` as separate processes and times each directly - the phase
+windows are exact rather than inferred from progress events. A direction that
+fails is omitted rather than recorded as zero, so a failed upload cannot
+masquerade as a saturated link carrying nothing.
+
+**LibreSpeed's ceiling is the thing to watch.** On a line where Ookla reaches
+~947 Mbps upload, LibreSpeed reaches ~774, and raising `--ls-concurrent` makes
+it worse (8 -> 774, 16 -> 704, 32 -> 583). It therefore cannot exercise a shaper
+set above roughly 780 Mbps. Such a run still validates as trustworthy, because
+saturation is checked against reported throughput rather than against line rate,
+so this will not announce itself. If you are tuning egress near gigabit, use
+Ookla.
+
+Runs recorded before this option existed are treated as Ookla, which they were.
 
 ### `--repeat N` - the flag that makes tuning honest
 
@@ -236,7 +290,10 @@ Practical planning: **three arms of eight, then expect to wait.** Decide which
 comparisons matter before you start, because you will not get to run them all
 back to back.
 bufferscope surfaces the error and aborts after two consecutive failed runs rather
-than grinding through the rest of the repeat.
+than grinding through the rest of the repeat. The runs that already completed
+are still aggregated and written out - they are not suspect, and they cost
+minutes each - so an arm cut short by rate limiting remains usable, and the
+saved document records why it stopped early.
 
 ### Seeing the whole household, not just this PC
 
@@ -324,6 +381,13 @@ queries per second. A device that does not answer produces a warning on stderr
 and is skipped - the run continues on whatever did respond, rather than failing.
 The same counter-granularity caveat below applies per device, and cheap access
 points often refresh their counters far more slowly than a router does.
+
+**Counter width.** bufferscope reads the 64-bit `ifHC` octet counters where a
+device implements them, and falls back to the 32-bit originals where it does
+not - which many access points do not. The 32-bit counters wrap roughly every
+34 seconds at gigabit, so each delta is corrected against the counter's
+modulus: a reading lower than the previous one is treated as a wrap where that
+yields a plausible delta, and as a counter reset otherwise.
 
 **Counter granularity - read this before trusting a short window.** Routers
 refresh SNMP counters on their own schedule, and the rate varies widely by
@@ -510,6 +574,9 @@ throughput timeline instead of the load generator's own phase claims.
   "schema_version": 1,
   "bufferscope_version": "1.0.0",
   "started_at": "2026-08-21T13:33:07",
+  "mode": "bufferbloat",  // or "classes", "probe", "monitor"
+  "generator": "ookla",   // or "librespeed"; absent on runs that
+                          // predate the option, which were ookla
   "env": {
     "os", "python", "bufferscope_version", "schema_version",
     "gateway",            // detected default gateway, or null
@@ -524,7 +591,10 @@ throughput timeline instead of the load generator's own phase claims.
   "phases": {
     "idle" | "download" | "upload": {
       "throughput_mbps_nic",       // measured from NIC counters
-      "throughput_mbps_reported",  // what Ookla claimed
+      "throughput_mbps_reported",  // what the generator claimed
+      "router_note",               // present instead of a router figure
+                                   // when the window was too short for
+                                   // the device's counter refresh rate
       "probes": {
         "<probe name>": {
           "n", "lost", "loss_pct",
@@ -540,12 +610,64 @@ throughput timeline instead of the load generator's own phase claims.
     "worst_added_p95_ms",
     "overall_grade"
   },
-  "validation": {"trustworthy": bool, "reasons": [str]}
+  "validation": {"trustworthy": bool, "reasons": [str]},
+  "devices": [            // present with --router-snmp / --snmp-device
+    {"label", "host", "down_mbps", "up_mbps", "interface",
+     "sample_count", "source": "snmp",
+     "note"}             // present instead of figures when unmeasurable
+  ]
 }
 ```
 
 Probe names encode transport and target: `tcp:1.1.1.1:443`, `dns:1.1.1.1`,
 `icmp:192.168.1.1`.
+
+### Before you share a result file
+
+Result files are meant to be shared - pasted into a bug report, or sent to a
+vendor chasing a fault. Two fields describe you rather than the network:
+
+- **`speedtest.result_url`** links to a public speedtest.net page showing your
+  ISP and your approximate location. Ookla publishes that page; bufferscope
+  only records the link to it. Drop the field if the recipient does not need it.
+- **`env.speedtest_path`** would otherwise carry your account name, so the home
+  directory is replaced with `~` before the file is written.
+
+Nothing else in a result file identifies the operator. SNMP community strings
+are never written out - a device is recorded by label and host only. The
+`server` block describes the speedtest server, not you. Probe targets are
+whichever ones you asked for.
+
+`--repeat N` writes a different, wrapping document. The individual runs are
+kept in full, so nothing is lost by aggregating:
+
+```
+{
+  "schema_version": 1,
+  "bufferscope_version": "1.0.0",
+  "started_at": "2026-08-21T17:15:10",
+  "env": { ... },        // the first run's environment
+  "repeat": {"n": 5, "completed": 5, "aborted": false},
+  "runs": [ ... ],       // every completed run, in the shape above
+  "aggregate": {
+    "included_runs", "excluded_runs",
+    "exclusions": [str],       // why each run was left out
+    "speedtest": {"download_mbps" | "upload_mbps" | ...: STATS},
+    "<loaded phase>": {"<probe name>": STATS}
+                               // added p95 vs that run's own idle
+                               // baseline, e.g. "upload": {"dns-class1": ...}
+  },
+  "validation": {"trustworthy": bool, "reasons": [str]}
+}
+```
+
+where `STATS` is `{"n", "mean", "stdev", "min", "max", "ci95_lo", "ci95_hi",
+"values"}` - `values` keeps the per-run figures so an arm can be re-pooled by
+hand.
+
+An arm that aborted early is written in this same shape, with `repeat.aborted`
+true and the reason in `validation.reasons`. Arms recorded before that field
+existed carry `repeat` as `{"n": N}` alone.
 
 ## How it works
 
@@ -572,16 +694,17 @@ Probe names encode transport and target: `tcp:1.1.1.1:443`, `dns:1.1.1.1`,
 - **ICMP needs privileges.** Raw sockets require root on Linux/macOS and admin on
   Windows. Without them bufferscope silently uses TCP and UDP probes, which are
   unprivileged and sub-millisecond. Detail degrades; correctness does not.
-- **Ookla is required.** Self-generated HTTP load was tried and abandoned:
-  providers rate-limit concurrent connections per source IP well below a gigabit,
-  silently capping the load and invalidating results.
+- **An external load generator is required.** Self-generated HTTP load was tried
+  and abandoned: providers rate-limit concurrent connections per source IP well
+  below a gigabit, silently capping the load and invalidating results. Ookla or
+  LibreSpeed does the saturating instead.
 - **IPv4 only.** No IPv6-specific handling.
 - **Not a router configuration tool.** It measures; you make the changes.
 
 ## Testing
 
 ```bash
-python -m unittest test_bufferscope -v          # 82 tests, offline
+python -m unittest test_bufferscope -v          # 239 tests, offline
 BUFFERSCOPE_E2E=1 python -m unittest test_bufferscope.TestEndToEnd -v
 ```
 
