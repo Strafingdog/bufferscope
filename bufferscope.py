@@ -14,6 +14,7 @@ import os
 import platform
 import random
 import re
+import shlex
 import shutil
 import socket
 import struct
@@ -278,6 +279,65 @@ def aggregate_runs(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
                 speed.setdefault(key, []).append(float(value))
     out["speedtest"] = {k: _stats_block(v) for k, v in speed.items()}
     return out
+
+
+_AGG_META = ("excluded_runs", "included_runs", "exclusions")
+
+
+def _arm_aggregate(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """An arm's aggregate, recomputed from its raw runs where they survive."""
+    if doc.get("runs"):
+        return aggregate_runs(doc["runs"])
+    return doc.get("aggregate") or {}
+
+
+def pool_arms(docs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Combine several arms of one condition into a single document.
+
+    Each arm contributes its own mean, not its individual runs. Runs inside an
+    arm share their conditions - the same evening, the same route, the same
+    server - so treating them as independent replicates would understate the
+    spread and manufacture significance. On the line this was written against,
+    between-arm stdev was 4.59 ms, larger than the within-arm figure, which is
+    why the rule is three arms a side rather than one arm of fifteen runs.
+    """
+    if not docs:
+        raise ValueError("no arms to pool")
+
+    aggs = [_arm_aggregate(doc) for doc in docs]
+    pooled: Dict[str, Any] = {"included_runs": 0, "excluded_runs": 0,
+                              "exclusions": []}
+    means: Dict[Tuple[str, str], List[float]] = {}
+    for agg in aggs:
+        pooled["included_runs"] += agg.get("included_runs", 0)
+        pooled["excluded_runs"] += agg.get("excluded_runs", 0)
+        pooled["exclusions"].extend(agg.get("exclusions") or [])
+        for group, block in agg.items():
+            if group in _AGG_META or not isinstance(block, dict):
+                continue
+            for key, stats in block.items():
+                if not isinstance(stats, dict):
+                    continue
+                mean = stats.get("mean")
+                if isinstance(mean, (int, float)):
+                    means.setdefault((group, key), []).append(float(mean))
+    for (group, key), values in means.items():
+        pooled.setdefault(group, {})[key] = _stats_block(values)
+
+    doc = {
+        "schema_version": SCHEMA_VERSION,
+        "bufferscope_version": VERSION,
+        "started_at": docs[0].get("started_at"),
+        "env": docs[0].get("env") or {},
+        "pooled": {"arms": len(docs), "runs": pooled["included_runs"],
+                   "excluded_runs": pooled["excluded_runs"]},
+        "aggregate": pooled,
+    }
+    reasons = []
+    if len(docs) < 2:
+        reasons.append("a single arm cannot show between-arm spread")
+    doc["validation"] = {"trustworthy": not reasons, "reasons": reasons}
+    return doc
 
 
 # --------------------------------------------------------------------------
@@ -1954,6 +2014,96 @@ class SnmpDeviceGroup:
 # --------------------------------------------------------------------------
 
 
+ALERT_METRICS = ("p95", "loss_pct")
+
+
+def evaluate_alerts(stats_by_probe: Dict[str, Dict[str, Any]],
+                    p95: Optional[float] = None,
+                    loss: Optional[float] = None,
+                    at: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Breaches in one interval, one entry per probe and metric.
+
+    A threshold left unset never fires, and a metric the interval could not
+    measure is not a breach: silence is not the same as a good reading.
+    """
+    thresholds = {"p95": p95, "loss_pct": loss}
+    breaches: List[Dict[str, Any]] = []
+    for name in sorted(stats_by_probe):
+        stats = stats_by_probe[name] or {}
+        for metric in ALERT_METRICS:
+            threshold = thresholds.get(metric)
+            if threshold is None:
+                continue
+            value = stats.get(metric)
+            if not isinstance(value, (int, float)):
+                continue
+            if value > threshold:
+                breaches.append({"probe": name, "metric": metric,
+                                 "value": float(value),
+                                 "threshold": float(threshold), "at": at})
+    return breaches
+
+
+class AlertGate:
+    """Rate limits alerts so a bad hour notifies once, not sixty times."""
+
+    def __init__(self, cooldown: float = 300.0):
+        self.cooldown = float(cooldown)
+        self._last: Dict[str, float] = {}
+
+    def allow(self, key: str, now: Optional[float] = None) -> bool:
+        moment = time.time() if now is None else now
+        last = self._last.get(key)
+        if last is not None and moment - last < self.cooldown:
+            return False
+        self._last[key] = moment
+        return True
+
+
+def _split_command(cmd: str) -> List[str]:
+    """Split a command line without handing it to a shell.
+
+    On Windows, posix splitting would eat the backslashes out of a path, so the
+    non-posix splitter is used there and its leftover quotes stripped instead.
+    """
+    parts = shlex.split(cmd, posix=(os.name != "nt"))
+    if os.name == "nt":
+        stripped = []
+        for part in parts:
+            if len(part) > 1 and part[0] == part[-1] and part[0] in ("'", '"'):
+                part = part[1:-1]
+            stripped.append(part)
+        parts = stripped
+    return parts
+
+
+def run_alert_command(cmd: str, breach: Dict[str, Any]) -> bool:
+    """Run the alert command, passing context in the environment.
+
+    Never raises and never uses a shell. A monitor that died because a notifier
+    failed would lose the measurement it existed to take, and breach values are
+    interpolated nowhere - they are environment variables only.
+    """
+    try:
+        parts = _split_command(cmd)
+    except ValueError as exc:
+        print("alert command could not be parsed: %s" % exc, file=sys.stderr)
+        return False
+    if not parts:
+        return False
+    env = dict(os.environ)
+    env["BUFFERSCOPE_ALERT_PROBE"] = str(breach.get("probe") or "")
+    env["BUFFERSCOPE_ALERT_METRIC"] = str(breach.get("metric") or "")
+    env["BUFFERSCOPE_ALERT_VALUE"] = str(breach.get("value"))
+    env["BUFFERSCOPE_ALERT_THRESHOLD"] = str(breach.get("threshold"))
+    env["BUFFERSCOPE_ALERT_AT"] = str(breach.get("at") or "")
+    try:
+        return subprocess.run(parts, env=env, timeout=30).returncode == 0
+    except Exception as exc:
+        print("alert command failed: %s" % exc, file=sys.stderr)
+        return False
+
+
 def build_result(env: Dict[str, Any],
                  speedtest_result: Dict[str, Any],
                  phase_buckets: Dict[str, Dict[str, List[Sample]]],
@@ -2193,6 +2343,7 @@ def render_compare(a: Dict[str, Any], b: Dict[str, Any]) -> str:
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_UNTRUSTWORTHY = 2
+EXIT_ALERT = 3
 
 EMPTY_SPEEDTEST = {
     "download_mbps": None, "upload_mbps": None, "idle_latency_ms": None,
@@ -2284,6 +2435,17 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(monitor)
     monitor.add_argument("--duration", type=int, default=3600)
     monitor.add_argument("--interval", type=int, default=60)
+    monitor.add_argument("--alert-p95", type=float, metavar="MS",
+                         help="alert when an interval p95 exceeds MS")
+    monitor.add_argument("--alert-loss", type=float, metavar="PCT",
+                         help="alert when an interval loss exceeds PCT")
+    monitor.add_argument("--alert-cooldown", type=float, default=300.0,
+                         metavar="SECS",
+                         help="minimum gap between on-alert commands for one "
+                              "probe and metric (default 300)")
+    monitor.add_argument("--on-alert", metavar="CMD",
+                         help="command to run on a breach. No shell is used; "
+                              "context arrives in BUFFERSCOPE_ALERT_* env vars")
 
     router = subparsers.add_parser(
         "router", help="list router interfaces and counters over SNMP")
@@ -2297,8 +2459,13 @@ def build_parser() -> argparse.ArgumentParser:
     env_parser.add_argument("--json", action="store_true")
 
     compare = subparsers.add_parser("compare", help="diff two saved runs")
-    compare.add_argument("file_a")
-    compare.add_argument("file_b")
+    compare.add_argument("file_a", nargs="?")
+    compare.add_argument("file_b", nargs="?")
+    compare.add_argument("-a", "--arm-a", nargs="+", metavar="FILE",
+                         help="pool these arms as side A. Repeated arms of one "
+                              "condition are pooled by arm, not by run")
+    compare.add_argument("-b", "--arm-b", nargs="+", metavar="FILE",
+                         help="pool these arms as side B")
     return parser
 
 
@@ -2503,31 +2670,77 @@ def doc_generator(doc: Dict[str, Any]) -> str:
     return str(doc.get("generator") or "ookla")
 
 
+def _load_doc(path: str) -> Dict[str, Any]:
+    with open(path, "r") as handle:
+        return json.load(handle)
+
+
 def cmd_compare(args: "argparse.Namespace") -> int:
-    docs = []
-    for path in (args.file_a, args.file_b):
-        try:
-            with open(path, "r") as handle:
-                docs.append(json.load(handle))
-        except Exception as exc:
-            print("error: cannot read %s: %s" % (path, exc), file=sys.stderr)
+    arm_a = getattr(args, "arm_a", None)
+    arm_b = getattr(args, "arm_b", None)
+    pooling = bool(arm_a or arm_b)
+
+    if pooling:
+        if getattr(args, "file_a", None) or getattr(args, "file_b", None):
+            print("error: give either two positional files or -a/-b arms, "
+                  "not both", file=sys.stderr)
             return EXIT_ERROR
-    if docs[0].get("schema_version") != docs[1].get("schema_version"):
+        if not (arm_a and arm_b):
+            print("error: pooling needs both -a and -b", file=sys.stderr)
+            return EXIT_ERROR
+        sides = [list(arm_a), list(arm_b)]
+    else:
+        if not (getattr(args, "file_a", None) and getattr(args, "file_b", None)):
+            print("error: compare needs two files, or -a/-b arms",
+                  file=sys.stderr)
+            return EXIT_ERROR
+        sides = [[args.file_a], [args.file_b]]
+
+    loaded: List[List[Dict[str, Any]]] = []
+    for paths in sides:
+        docs = []
+        for path in paths:
+            try:
+                docs.append(_load_doc(path))
+            except Exception as exc:
+                print("error: cannot read %s: %s" % (path, exc), file=sys.stderr)
+                return EXIT_ERROR
+        loaded.append(docs)
+
+    every = loaded[0] + loaded[1]
+    if len({doc.get("schema_version") for doc in every}) > 1:
         print("error: results use incompatible schema versions", file=sys.stderr)
         return EXIT_ERROR
+
+    generators = {doc_generator(doc) for doc in every}
+    if len(generators) > 1:
+        # Measured on this line minutes apart: Ookla gave download +3.9 ms /
+        # upload +26.5 ms, Waveform gave +11.3 / +3.6. Inverted. Latency
+        # numbers from two generators are not the same measurement.
+        print("WARNING: these runs used different load generators (%s). "
+              "Latency comparisons across generators are not meaningful; "
+              "throughput is more robust but still suspect.\n"
+              % ", ".join(sorted(generators)))
+
+    if pooling:
+        docs_a, docs_b = pool_arms(loaded[0]), pool_arms(loaded[1])
+        print("pooled: A = %d arms (%d runs)   B = %d arms (%d runs)"
+              % (docs_a["pooled"]["arms"], docs_a["pooled"]["runs"],
+                 docs_b["pooled"]["arms"], docs_b["pooled"]["runs"]))
+        print("each arm contributes its own mean, so the interval carries "
+              "between-arm spread\n")
+        for doc in (docs_a, docs_b):
+            for reason in (doc.get("validation") or {}).get("reasons") or []:
+                print("note: %s" % reason)
+        print(render_compare_aggregate(docs_a, docs_b))
+        return EXIT_OK
+
+    docs = [loaded[0][0], loaded[1][0]]
     for doc in docs:
         # Raw runs are stored, so aggregation rules can be improved without
         # invalidating measurements already taken.
         if doc.get("runs"):
             doc["aggregate"] = aggregate_runs(doc["runs"])
-    gen_a, gen_b = doc_generator(docs[0]), doc_generator(docs[1])
-    if gen_a != gen_b:
-        # Measured on this line minutes apart: Ookla gave download +3.9 ms /
-        # upload +26.5 ms, Waveform gave +11.3 / +3.6. Inverted. Latency
-        # numbers from two generators are not the same measurement.
-        print("WARNING: these runs used different load generators (%s vs %s). "
-              "Latency comparisons across generators are not meaningful; "
-              "throughput is more robust but still suspect.\n" % (gen_a, gen_b))
     if docs[0].get("aggregate") and docs[1].get("aggregate"):
         print(render_compare_aggregate(docs[0], docs[1]))
     else:
@@ -2884,19 +3097,41 @@ def cmd_monitor(args: "argparse.Namespace") -> int:
     router = start_router_sampler(args, runner.origin())
     deadline = time.perf_counter() + max(1, args.duration)
     consumed = {p.name: 0 for p in probes}
+    alert_p95 = getattr(args, "alert_p95", None)
+    alert_loss = getattr(args, "alert_loss", None)
+    on_alert = getattr(args, "on_alert", None)
+    gate = AlertGate(getattr(args, "alert_cooldown", 300.0) or 300.0)
+    alerts: List[Dict[str, Any]] = []
     try:
         while time.perf_counter() < deadline:
             remaining = deadline - time.perf_counter()
             time.sleep(max(0.0, min(args.interval, remaining)))
             snapshot = runner.samples()
+            interval_stats: Dict[str, Dict[str, Any]] = {}
             for name, series in snapshot.items():
                 fresh = series[consumed[name]:]
                 consumed[name] = len(series)
                 stats = summarize(fresh)
+                interval_stats[name] = stats
                 print("%-28s n=%-5d p50=%s p95=%s max=%s loss=%s%%" % (
                     name[:28], stats["n"] + stats["lost"],
                     _fmt(stats["p50"], 7), _fmt(stats["p95"], 7),
                     _fmt(stats["max"], 8), _fmt(stats["loss_pct"], 5, 1)))
+            moment = datetime.datetime.now().isoformat(timespec="seconds")
+            for breach in evaluate_alerts(interval_stats, p95=alert_p95,
+                                          loss=alert_loss, at=moment):
+                alerts.append(breach)
+                print("ALERT  %s %s %.2f over threshold %.2f" % (
+                    breach["probe"], breach["metric"], breach["value"],
+                    breach["threshold"]))
+                if on_alert:
+                    key = "%s/%s" % (breach["probe"], breach["metric"])
+                    if gate.allow(key):
+                        ok = run_alert_command(on_alert, breach)
+                        print("       on-alert command %s"
+                              % ("ok" if ok else "FAILED"))
+                    else:
+                        print("       on-alert held down by cooldown")
             print("")
     except KeyboardInterrupt:
         print("(interrupted - writing partial result)", file=sys.stderr)
@@ -2914,7 +3149,10 @@ def cmd_monitor(args: "argparse.Namespace") -> int:
     if router:
         result["devices"] = router.device_reports(
             keep_samples=getattr(args, "raw", False))
+    result["alerts"] = alerts
     _emit(result, args, render_human(result))
+    if alerts:
+        return EXIT_ALERT
     return EXIT_OK if result["validation"]["trustworthy"] else EXIT_UNTRUSTWORTHY
 
 

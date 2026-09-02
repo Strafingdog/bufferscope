@@ -4,7 +4,10 @@ import contextlib
 import io
 import json
 import os
+import socket
+import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -2460,3 +2463,268 @@ class TestGeneratorProvenance(unittest.TestCase):
             with contextlib.redirect_stdout(buf):
                 bufferscope.cmd_compare(argparse.Namespace(file_a=a, file_b=b))
             self.assertNotIn("different load generators", buf.getvalue())
+
+
+def _arm(mean, spread=0.1, n=5):
+    """One arm whose runs sit tightly around `mean` added-latency ms."""
+    step = (spread * 2) / (n - 1) if n > 1 else 0.0
+    return _agg_doc([mean - spread + step * i for i in range(n)])
+
+
+class TestPoolArms(unittest.TestCase):
+    """Runs inside one arm share conditions, so the arm is the unit."""
+
+    def test_each_arm_contributes_one_value(self):
+        pooled = bufferscope.pool_arms([_arm(10.0), _arm(11.0), _arm(12.0)])
+        values = pooled["aggregate"]["upload"]["ctrl"]["values"]
+        self.assertEqual(len(values), 3)
+        self.assertAlmostEqual(sorted(values)[0], 10.0, places=6)
+
+    def test_records_arm_and_run_counts(self):
+        pooled = bufferscope.pool_arms([_arm(10.0, n=5), _arm(11.0, n=4)])
+        self.assertEqual(pooled["pooled"]["arms"], 2)
+        self.assertEqual(pooled["pooled"]["runs"], 9)
+
+    def test_between_arm_spread_widens_the_interval(self):
+        # Same grand mean either way. Only the disagreement between arms
+        # differs, and that is exactly what the interval must reflect.
+        tight = bufferscope.pool_arms([_arm(9.8), _arm(10.0), _arm(10.2)])
+        loose = bufferscope.pool_arms([_arm(5.0), _arm(10.0), _arm(15.0)])
+        def width(doc):
+            s = doc["aggregate"]["upload"]["ctrl"]
+            return s["ci95_hi"] - s["ci95_lo"]
+        self.assertAlmostEqual(tight["aggregate"]["upload"]["ctrl"]["mean"],
+                               loose["aggregate"]["upload"]["ctrl"]["mean"],
+                               places=6)
+        self.assertGreater(width(loose), width(tight) * 5)
+
+    def test_single_arm_pools_to_itself(self):
+        pooled = bufferscope.pool_arms([_arm(10.0, n=5)])
+        self.assertEqual(pooled["pooled"]["arms"], 1)
+        self.assertEqual(len(pooled["aggregate"]["upload"]["ctrl"]["values"]), 1)
+
+    def test_rejects_no_arms(self):
+        with self.assertRaises(ValueError):
+            bufferscope.pool_arms([])
+
+
+class TestComparePooledArms(CliMixin, unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _write(self, doc, name):
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "w") as handle:
+            json.dump(doc, handle)
+        return path
+
+    def _side(self, means, prefix):
+        return [self._write(_arm(m), "%s%d.json" % (prefix, i))
+                for i, m in enumerate(means)]
+
+    def test_pools_three_arms_a_side(self):
+        a = self._side([9.8, 10.0, 10.2], "a")
+        b = self._side([39.8, 40.0, 40.2], "b")
+        code, out, _ = self._run(["compare", "-a"] + a + ["-b"] + b)
+        self.assertEqual(code, 0)
+        self.assertIn("3 arms", out)
+        self.assertIn("SIGNIFICANT", out.upper())
+
+    def test_between_arm_noise_prevents_a_false_verdict(self):
+        # Arm means straddle each other. Naive run-level pooling would call
+        # this significant; arm-level pooling must not.
+        a = self._side([5.0, 10.0, 15.0], "a")
+        b = self._side([8.0, 13.0, 18.0], "b")
+        code, out, _ = self._run(["compare", "-a"] + a + ["-b"] + b)
+        self.assertEqual(code, 0)
+        self.assertIn("not distinguishable", out.lower())
+
+    def test_positional_two_file_form_still_works(self):
+        a = self._write(_arm(10.0), "one.json")
+        b = self._write(_arm(40.0), "two.json")
+        code, out, _ = self._run(["compare", a, b])
+        self.assertEqual(code, 0)
+        self.assertIn("SIGNIFICANT", out.upper())
+
+    def test_mixing_positional_and_arm_flags_is_rejected(self):
+        a = self._write(_arm(10.0), "one.json")
+        code, _, err = self._run(["compare", a, "-b", a])
+        self.assertNotEqual(code, 0)
+        self.assertIn("either", err.lower())
+
+
+class TestEvaluateAlerts(unittest.TestCase):
+    def _stats(self, p95=None, loss=None):
+        return {"probe": {"p95": p95, "loss_pct": loss}}
+
+    def test_p95_over_threshold_is_a_breach(self):
+        out = bufferscope.evaluate_alerts(self._stats(p95=62.3), p95=50.0)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["probe"], "probe")
+        self.assertEqual(out[0]["metric"], "p95")
+        self.assertAlmostEqual(out[0]["value"], 62.3)
+        self.assertAlmostEqual(out[0]["threshold"], 50.0)
+
+    def test_p95_under_threshold_is_quiet(self):
+        self.assertEqual(bufferscope.evaluate_alerts(self._stats(p95=4.9),
+                                                     p95=50.0), [])
+
+    def test_p95_exactly_at_threshold_is_quiet(self):
+        self.assertEqual(bufferscope.evaluate_alerts(self._stats(p95=50.0),
+                                                     p95=50.0), [])
+
+    def test_loss_over_threshold_is_a_breach(self):
+        out = bufferscope.evaluate_alerts(self._stats(loss=3.0), loss=1.0)
+        self.assertEqual([b["metric"] for b in out], ["loss_pct"])
+
+    def test_no_thresholds_means_no_breaches(self):
+        self.assertEqual(bufferscope.evaluate_alerts(self._stats(p95=999.0)), [])
+
+    def test_absent_measurement_is_not_a_breach(self):
+        self.assertEqual(bufferscope.evaluate_alerts(self._stats(p95=None),
+                                                     p95=1.0), [])
+
+
+class TestAlertGate(unittest.TestCase):
+    def test_first_breach_fires(self):
+        gate = bufferscope.AlertGate(cooldown=300.0)
+        self.assertTrue(gate.allow("probe/p95", now=1000.0))
+
+    def test_repeat_within_cooldown_is_suppressed(self):
+        gate = bufferscope.AlertGate(cooldown=300.0)
+        gate.allow("probe/p95", now=1000.0)
+        self.assertFalse(gate.allow("probe/p95", now=1200.0))
+
+    def test_fires_again_once_cooldown_elapses(self):
+        gate = bufferscope.AlertGate(cooldown=300.0)
+        gate.allow("probe/p95", now=1000.0)
+        self.assertTrue(gate.allow("probe/p95", now=1301.0))
+
+    def test_a_different_probe_is_not_suppressed(self):
+        gate = bufferscope.AlertGate(cooldown=300.0)
+        gate.allow("probe/p95", now=1000.0)
+        self.assertTrue(gate.allow("other/p95", now=1000.0))
+
+
+class TestAlertCommand(unittest.TestCase):
+    def test_runs_the_command_with_context_in_the_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "fired.txt")
+            script = ("import os,sys;"
+                      "open(sys.argv[1],'w').write("
+                      "os.environ['BUFFERSCOPE_ALERT_PROBE']+' '+"
+                      "os.environ['BUFFERSCOPE_ALERT_VALUE'])")
+            cmd = '%s -c "%s" %s' % (sys.executable, script, out)
+            ok = bufferscope.run_alert_command(
+                cmd, {"probe": "icmp:1.1.1.1", "metric": "p95",
+                      "value": 62.3, "threshold": 50.0})
+            self.assertTrue(ok)
+            with open(out) as handle:
+                self.assertEqual(handle.read(), "icmp:1.1.1.1 62.3")
+
+    def test_a_failing_command_is_reported_not_raised(self):
+        ok = bufferscope.run_alert_command(
+            "definitely-not-a-real-binary-9f3c", {"probe": "p", "metric": "m",
+                                                  "value": 1.0, "threshold": 0.0})
+        self.assertFalse(ok)
+
+    def test_no_shell_is_used(self):
+        # A shell would expand this into two commands and create the file.
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = os.path.join(tmp, "shelled.txt")
+            bufferscope.run_alert_command(
+                "%s -c pass && %s -c \"open(r'%s','w')\""
+                % (sys.executable, sys.executable, marker),
+                {"probe": "p", "metric": "m", "value": 1.0, "threshold": 0.0})
+            self.assertFalse(os.path.exists(marker))
+
+
+@contextlib.contextmanager
+def _tcp_listener():
+    """A real socket to probe, so intervals carry genuine latency samples."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(64)
+    srv.settimeout(0.2)
+    stop = threading.Event()
+
+    def serve():
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+                conn.close()
+            except Exception:
+                pass
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        yield srv.getsockname()[1]
+    finally:
+        stop.set()
+        thread.join(timeout=2)
+        srv.close()
+
+
+class TestMonitorAlerting(CliMixin, unittest.TestCase):
+    def setUp(self):
+        self._env = bufferscope.collect_env
+        bufferscope.collect_env = lambda: {"os": "test", "gateway": None,
+                                           "icmp_available": False}
+        self._run_st, self._find = (bufferscope.run_speedtest,
+                                    bufferscope.find_speedtest)
+        bufferscope.find_speedtest = lambda: None
+
+    def tearDown(self):
+        bufferscope.collect_env = self._env
+        bufferscope.run_speedtest = self._run_st
+        bufferscope.find_speedtest = self._find
+
+    def _monitor(self, port, *extra):
+        return self._run(["monitor", "--duration", "2", "--interval", "1",
+                          "--probe-interval", "50", "--no-gateway",
+                          "--probe", "tcp:127.0.0.1:%d#local" % port]
+                         + list(extra))
+
+    def test_breach_sets_the_alert_exit_code(self):
+        with _tcp_listener() as port:
+            code, out, _ = self._monitor(port, "--alert-p95", "0")
+        self.assertEqual(code, bufferscope.EXIT_ALERT)
+        self.assertIn("ALERT", out.upper())
+
+    def test_quiet_run_keeps_the_normal_exit_code(self):
+        with _tcp_listener() as port:
+            code, out, _ = self._monitor(port, "--alert-p95", "100000")
+        self.assertIn(code, (bufferscope.EXIT_OK,
+                             bufferscope.EXIT_UNTRUSTWORTHY))
+        self.assertNotIn("ALERT", out.upper())
+
+    def test_breaches_are_recorded_in_the_document(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "m.json")
+            with _tcp_listener() as port:
+                self._monitor(port, "--alert-p95", "0", "--out", path)
+            with open(path) as handle:
+                doc = json.load(handle)
+            self.assertTrue(doc["alerts"])
+            self.assertEqual(doc["alerts"][0]["metric"], "p95")
+
+    def test_cooldown_holds_down_repeat_commands(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            counter = os.path.join(tmp, "count")
+            script = ("import os,sys;"
+                      "p=sys.argv[1];"
+                      "n=open(p).read() if os.path.exists(p) else '';"
+                      "open(p,'w').write(n+'x')")
+            cmd = "%s -c %s%s%s %s" % (sys.executable, chr(34), script,
+                                       chr(34), counter)
+            with _tcp_listener() as port:
+                self._monitor(port, "--alert-p95", "0", "--on-alert", cmd,
+                              "--alert-cooldown", "3600")
+            fired = ""
+            if os.path.exists(counter):
+                with open(counter) as handle:
+                    fired = handle.read()
+            self.assertEqual(len(fired), 1)
